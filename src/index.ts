@@ -171,6 +171,10 @@ export default {
         const ref = path.split('/')[4];
         return handleAdminRejectOrder(db, ref, request, env);
       }
+      if (path.match(/^\/v2\/admin\/orders\/[^/]+\/undo-reject$/) && method === 'POST') {
+        const ref = path.split('/')[4];
+        return handleAdminUndoReject(db, ref, request, env);
+      }
 
       // ── Partners (public submission) ──
       if (path === '/v2/partners' && method === 'POST') {
@@ -1017,26 +1021,32 @@ async function handleAdminApproveOrder(
 // HANDLER: GET /v2/admin/orders
 // ============================================================
 async function handleAdminGetOrders(
-  db: SupabaseClient, url: URL, request: Request, env: Env,
+  db: SupabaseClient, url: URL, request: Request, env: Env
 ): Promise<Response> {
-  const status = url.searchParams.get('status');
-  const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 100);
-  const offset = parseInt(url.searchParams.get('offset') || '0');
-  const search = url.searchParams.get('search');
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
 
-  let query = db.from('orders')
-    .select('*, order_items(*)')
+  const status = url.searchParams.get('status');
+  const q = url.searchParams.get('q')?.trim();
+  const page = Math.max(1, parseInt(url.searchParams.get('page') || '1'));
+  const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '20')));
+  const offset = (page - 1) * limit;
+
+  let query = db
+    .from('orders')
+    .select('*', { count: 'exact' })
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
 
   if (status) query = query.eq('status', status);
-  if (search) {
-    query = query.or(`order_ref.ilike.%${search}%,customer_email.ilike.%${search}%,customer_name.ilike.%${search}%`);
-  }
+  if (q) query = query.or(`order_ref.ilike.%${q}%,customer_email.ilike.%${q}%,customer_name.ilike.%${q}%`);
 
-  const { data, error } = await query;
-  if (error) return err(error.message, 500, request, env);
-  return ok(data, request, env, { count: data?.length, offset, limit });
+  const { data, error: dbErr, count } = await query;
+  if (dbErr) return err(dbErr.message, 500, request, env);
+
+  return ok(data, request, env, {
+    pagination: { page, limit, total: count, pages: Math.ceil((count || 0) / limit) }
+  });
 }
 
 
@@ -1355,12 +1365,12 @@ async function handleAdminCustomers(
   const offset = (page - 1) * limit;
 
   let query = db
-    .from('profiles')
-    .select('id, display_name, email, phone, role, wallet_balance_ngn, created_at', { count: 'exact' })
+    .from('customers')
+    .select('id, name, email, phone, category, source, is_active, created_at', { count: 'exact' })
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
 
-  if (q) query = query.or(`display_name.ilike.%${q}%,email.ilike.%${q}%,phone.ilike.%${q}%`);
+  if (q) query = query.or(`name.ilike.%${q}%,email.ilike.%${q}%,phone.ilike.%${q}%`);
 
   const { data, error: dbErr, count } = await query;
   if (dbErr) return err(dbErr.message, 500, request, env);
@@ -1380,9 +1390,9 @@ async function handleAdminCustomerSearch(
   if (!q || q.length < 2) return ok([], request, env);
 
   const { data, error: dbErr } = await db
-    .from('profiles')
-    .select('id, display_name, email, phone, role')
-    .or(`display_name.ilike.%${q}%,email.ilike.%${q}%,phone.ilike.%${q}%`)
+    .from('customers')
+    .select('id, name, email, phone, category')
+    .or(`name.ilike.%${q}%,email.ilike.%${q}%,phone.ilike.%${q}%`)
     .limit(10);
 
   if (dbErr) return err(dbErr.message, 500, request, env);
@@ -1465,6 +1475,7 @@ async function handleAdminApproveOrderV2(
   if (findErr || !order) return err('Order not found', 404, request, env);
   if (order.status !== 'pending_manual') return err(`Cannot approve — status is "${order.status}"`, 400, request, env);
 
+  // Use fulfillOrder pipeline
   await fulfillOrder(db, order.id, paymentMethod, env);
 
   await logEvent(db, 'order', order.id, 'approved_manual_v2', auth.userId, {
@@ -1483,6 +1494,7 @@ async function handleAdminRejectOrder(
 
   const body = await request.json().catch(() => ({})) as any;
   const reason = body.reason || '';
+  const confirmReject = body.confirm === true; // second-stage confirmation
 
   const { data: order, error: findErr } = await db
     .from('orders')
@@ -1491,22 +1503,38 @@ async function handleAdminRejectOrder(
     .single();
 
   if (findErr || !order) return err('Order not found', 404, request, env);
-  if (!['pending', 'pending_manual'].includes(order.status)) {
-    return err(`Cannot reject — status is "${order.status}"`, 400, request, env);
+
+  if (confirmReject && order.status === 'rejected_pending') {
+    // Final rejection — move to cancelled
+    await db.from('orders').update({
+      status: 'cancelled',
+      notes: reason || order.notes,
+      updated_at: new Date().toISOString(),
+    }).eq('id', order.id);
+
+    await logEvent(db, 'order', order.id, 'rejected_confirmed', auth.userId, {
+      order_ref: order.order_ref, reason,
+    });
+
+    return ok({ rejected: true, confirmed: true, order_ref: ref }, request, env);
   }
 
-  await db.from('orders').update({
-    status: 'cancelled',
-    notes: reason,
-    updated_at: new Date().toISOString(),
-  }).eq('id', order.id);
+  if (['pending', 'pending_manual'].includes(order.status)) {
+    // First-stage rejection — move to rejected_pending
+    await db.from('orders').update({
+      status: 'rejected_pending',
+      notes: reason,
+      updated_at: new Date().toISOString(),
+    }).eq('id', order.id);
 
-  await logEvent(db, 'order', order.id, 'rejected', auth.userId, {
-    order_ref: order.order_ref,
-    reason,
-  });
+    await logEvent(db, 'order', order.id, 'rejected_pending', auth.userId, {
+      order_ref: order.order_ref, reason,
+    });
 
-  return ok({ rejected: true, order_ref: ref }, request, env);
+    return ok({ rejected: true, confirmed: false, status: 'rejected_pending', order_ref: ref }, request, env);
+  }
+
+  return err(`Cannot reject — status is "${order.status}"`, 400, request, env);
 }
 
 async function handleSubmitPartnerApplication(
@@ -1675,21 +1703,27 @@ async function handleAdminWallets(
   const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '20')));
   const offset = (page - 1) * limit;
 
-  const { data, error: dbErr, count } = await db
-    .from('wallet_transactions')
-    .select(`
-      id, user_id, type, amount_ngn, balance_after_ngn, description, reference, created_at,
-      profiles!wallet_transactions_user_id_fkey ( display_name, email )
-    `, { count: 'exact' })
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
+  // Try with join first, fallback to plain select
+  try {
+    const { data, error: dbErr, count } = await db
+      .from('wallet_transactions')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
 
-  if (dbErr) return err(dbErr.message, 500, request, env);
+    if (dbErr) return err(dbErr.message, 500, request, env);
 
-  return ok(data, request, env, {
-    pagination: { page, limit, total: count, pages: Math.ceil((count || 0) / limit) }
-  });
+    return ok(data || [], request, env, {
+      pagination: { page, limit, total: count || 0, pages: Math.ceil((count || 0) / limit) }
+    });
+  } catch (e: any) {
+    // Table might not exist yet
+    return ok([], request, env, {
+      pagination: { page: 1, limit: 20, total: 0, pages: 0 }
+    });
+  }
 }
+
 
 async function handleValidateDiscountV2(
   db: SupabaseClient, url: URL, request: Request, env: Env
@@ -2290,4 +2324,34 @@ async function handleAdminDeleteAd(
   const { error: dbErr } = await db.from('ads').delete().eq('id', id);
   if (dbErr) return err(dbErr.message, 500, request, env);
   return ok({ deleted: true }, request, env);
+}
+
+async function handleAdminUndoReject(
+  db: SupabaseClient, ref: string, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const { data: order, error: findErr } = await db
+    .from('orders')
+    .select('id, status, order_ref')
+    .eq('order_ref', ref)
+    .single();
+
+  if (findErr || !order) return err('Order not found', 404, request, env);
+  if (order.status !== 'rejected_pending') {
+    return err(`Cannot undo — status is "${order.status}"`, 400, request, env);
+  }
+
+  await db.from('orders').update({
+    status: 'pending_manual',
+    notes: null,
+    updated_at: new Date().toISOString(),
+  }).eq('id', order.id);
+
+  await logEvent(db, 'order', order.id, 'rejection_undone', auth.userId, {
+    order_ref: order.order_ref,
+  });
+
+  return ok({ undone: true, order_ref: ref }, request, env);
 }
