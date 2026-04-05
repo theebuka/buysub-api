@@ -1,0 +1,37 @@
+# ============================================================
+# BUYSUB — Cloudflare Workers API Configuration
+# ============================================================
+name = "buysub-api-v2"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Environment variables (set via wrangler secret or dashboard)
+# SUPABASE_URL
+# SUPABASE_SERVICE_ROLE_KEY
+# PAYSTACK_SECRET_KEY
+# PAYSTACK_PUBLIC_KEY
+# RESEND_API_KEY
+# WHATSAPP_NUMBER
+# FRONTEND_URL
+# WEBHOOK_SECRET
+# ALLOWED_ORIGINS
+
+[vars]
+FRONTEND_URL = "https://app.buysub.ng"
+WHATSAPP_NUMBER = "2348107872916"
+ALLOWED_ORIGINS = "https://app.buysub.ng,https://buysub.ng,http://localhost:3000"
+
+# Routes — deploy alongside existing workers without conflict
+# The v2 prefix ensures no collision with your current proxy workers
+# routes = [
+#   { pattern = "buysub-api.ebuka-nwaju.workers.dev/v2/*", zone_name = "ebuka-nwaju.workers.dev" }
+# ]
+
+[build]
+command = "npm run build"
+
+# Dev settings
+[dev]
+port = 8787
+local_protocol = "http"
