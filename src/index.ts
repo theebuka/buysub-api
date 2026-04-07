@@ -157,9 +157,28 @@ export default {
       if (path === '/v2/admin/products' && method === 'GET') {
         return handleAdminProducts(db, url, request, env);
       }
+      if (path === '/v2/admin/products' && method === 'POST') {
+        return handleAdminCreateProduct(db, request, env);
+      }
       if (path.startsWith('/v2/admin/products/') && method === 'PATCH') {
         const productId = path.split('/v2/admin/products/')[1];
         return handleAdminUpdateProduct(db, productId, request, env);
+      }
+
+      // ── Admin Discounts (CRUD) ──
+      if (path === '/v2/admin/discounts' && method === 'GET') {
+        return handleAdminGetDiscounts(db, url, request, env);
+      }
+      if (path === '/v2/admin/discounts' && method === 'POST') {
+        return handleAdminCreateDiscount(db, request, env);
+      }
+      if (path.match(/^\/v2\/admin\/discounts\/[^/]+$/) && method === 'PATCH') {
+        const discountId = path.split('/v2/admin/discounts/')[1];
+        return handleAdminUpdateDiscount(db, discountId, request, env);
+      }
+      if (path.match(/^\/v2\/admin\/discounts\/[^/]+$/) && method === 'DELETE') {
+        const discountId = path.split('/v2/admin/discounts/')[1];
+        return handleAdminDeleteDiscount(db, discountId, request, env);
       }
 
       // ── Admin Order actions (approve/reject with ref in URL) ──
@@ -1437,8 +1456,9 @@ async function handleAdminUpdateProduct(
   const body = await request.json() as any;
 
   const allowed = [
-    'name', 'status', 'stock_status', 'price_1m', 'price_3m', 'price_6m', 'price_1y',
-    'category', 'tags', 'short_description', 'domain', 'billing_type', 'featured',
+    'name', 'slug', 'status', 'stock_status', 'price_1m', 'price_3m', 'price_6m', 'price_1y',
+    'category', 'tags', 'short_description', 'description', 'category_tagline',
+    'domain', 'billing_type', 'billing_period', 'featured', 'sort_order', 'image_url',
   ];
   const updates: Record<string, any> = {};
   for (const key of allowed) {
@@ -2354,4 +2374,246 @@ async function handleAdminUndoReject(
   });
 
   return ok({ undone: true, order_ref: ref }, request, env);
+}
+
+
+// ============================================================
+// HANDLER: POST /v2/admin/products (Create product)
+// ============================================================
+async function handleAdminCreateProduct(
+  db: SupabaseClient, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await request.json() as any;
+
+  if (!body.name || !body.slug) {
+    return err('Name and slug are required', 400, request, env);
+  }
+
+  // Check slug uniqueness
+  const { data: existing } = await db
+    .from('products')
+    .select('id')
+    .eq('slug', body.slug)
+    .limit(1);
+
+  if (existing && existing.length > 0) {
+    return err(`Slug "${body.slug}" already exists`, 400, request, env);
+  }
+
+  const allowed = [
+    'name', 'slug', 'status', 'stock_status', 'price_1m', 'price_3m', 'price_6m', 'price_1y',
+    'category', 'tags', 'short_description', 'description', 'category_tagline',
+    'domain', 'billing_type', 'billing_period', 'featured', 'sort_order', 'image_url',
+  ];
+  const insert: Record<string, any> = {};
+  for (const key of allowed) {
+    if (body[key] !== undefined) insert[key] = body[key];
+  }
+  // Defaults
+  if (!insert.status) insert.status = 'active';
+  if (!insert.stock_status) insert.stock_status = 'in_stock';
+  if (!insert.billing_type) insert.billing_type = 'subscription';
+  if (insert.sort_order === undefined) insert.sort_order = 100;
+  insert.created_at = new Date().toISOString();
+  insert.updated_at = new Date().toISOString();
+
+  const { data, error: dbErr } = await db
+    .from('products')
+    .insert(insert)
+    .select()
+    .single();
+
+  if (dbErr) return err(dbErr.message, 500, request, env);
+
+  await logEvent(db, 'product', data.id, 'created', auth.userId, { name: data.name });
+
+  return ok(data, request, env);
+}
+
+
+// ============================================================
+// HANDLER: GET /v2/admin/discounts (List all discount codes)
+// ============================================================
+async function handleAdminGetDiscounts(
+  db: SupabaseClient, url: URL, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit') || '100')));
+
+  const { data, error: dbErr } = await db
+    .from('discount_codes')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  if (dbErr) return err(dbErr.message, 500, request, env);
+  return ok(data, request, env);
+}
+
+
+// ============================================================
+// HANDLER: POST /v2/admin/discounts (Create discount code)
+// ============================================================
+async function handleAdminCreateDiscount(
+  db: SupabaseClient, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await request.json() as any;
+
+  if (!body.code) return err('Code is required', 400, request, env);
+  if (!body.type || !['percentage', 'fixed'].includes(body.type)) {
+    return err('Type must be "percentage" or "fixed"', 400, request, env);
+  }
+  if (body.value === undefined || body.value === null || Number(body.value) <= 0) {
+    return err('Value must be a positive number', 400, request, env);
+  }
+
+  // Check code uniqueness
+  const { data: existing } = await db
+    .from('discount_codes')
+    .select('id')
+    .eq('code', body.code.toUpperCase())
+    .limit(1);
+
+  if (existing && existing.length > 0) {
+    return err(`Discount code "${body.code}" already exists`, 400, request, env);
+  }
+
+  const allowed = [
+    'code', 'type', 'value', 'active', 'min_order_ngn', 'max_uses',
+    'expires_at', 'active_from', 'max_discount_ngn',
+    'included_products', 'excluded_products',
+    'included_categories', 'excluded_categories',
+    'auto_apply', 'scope', 'exclusive',
+  ];
+  const insert: Record<string, any> = {};
+  for (const key of allowed) {
+    if (body[key] !== undefined) insert[key] = body[key];
+  }
+  // Normalize
+  insert.code = (insert.code || '').toUpperCase();
+  if (insert.active === undefined) insert.active = true;
+  if (insert.times_used === undefined) insert.times_used = 0;
+  if (insert.min_order_ngn === undefined) insert.min_order_ngn = 0;
+  if (insert.auto_apply === undefined) insert.auto_apply = false;
+  if (insert.exclusive === undefined) insert.exclusive = false;
+  if (insert.scope === undefined) insert.scope = 'site_wide';
+  // Convert empty strings to null for date fields
+  if (insert.expires_at === '') insert.expires_at = null;
+  if (insert.active_from === '') insert.active_from = null;
+  // Convert empty strings to null for nullable text fields
+  if (insert.included_products === '') insert.included_products = null;
+  if (insert.excluded_products === '') insert.excluded_products = null;
+  if (insert.included_categories === '') insert.included_categories = null;
+  if (insert.excluded_categories === '') insert.excluded_categories = null;
+  // Convert 0/empty to null for nullable number fields
+  if (!insert.max_uses) insert.max_uses = null;
+  if (!insert.max_discount_ngn) insert.max_discount_ngn = null;
+
+  insert.created_at = new Date().toISOString();
+
+  const { data, error: dbErr } = await db
+    .from('discount_codes')
+    .insert(insert)
+    .select()
+    .single();
+
+  if (dbErr) return err(dbErr.message, 500, request, env);
+
+  await logEvent(db, 'discount', data.id, 'created', auth.userId, { code: data.code });
+
+  return ok(data, request, env);
+}
+
+
+// ============================================================
+// HANDLER: PATCH /v2/admin/discounts/:id (Update discount)
+// ============================================================
+async function handleAdminUpdateDiscount(
+  db: SupabaseClient, discountId: string, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await request.json() as any;
+
+  const allowed = [
+    'code', 'type', 'value', 'active', 'min_order_ngn', 'max_uses',
+    'expires_at', 'active_from', 'max_discount_ngn',
+    'included_products', 'excluded_products',
+    'included_categories', 'excluded_categories',
+    'auto_apply', 'scope', 'exclusive',
+  ];
+  const updates: Record<string, any> = {};
+  for (const key of allowed) {
+    if (body[key] !== undefined) updates[key] = body[key];
+  }
+
+  // Normalize
+  if (updates.code) updates.code = updates.code.toUpperCase();
+  if (updates.expires_at === '') updates.expires_at = null;
+  if (updates.active_from === '') updates.active_from = null;
+  if (updates.included_products === '') updates.included_products = null;
+  if (updates.excluded_products === '') updates.excluded_products = null;
+  if (updates.included_categories === '') updates.included_categories = null;
+  if (updates.excluded_categories === '') updates.excluded_categories = null;
+  if (updates.max_uses === 0 || updates.max_uses === '') updates.max_uses = null;
+  if (updates.max_discount_ngn === 0 || updates.max_discount_ngn === '') updates.max_discount_ngn = null;
+
+  if (Object.keys(updates).length === 0) {
+    return err('No valid fields to update', 400, request, env);
+  }
+
+  const { data, error: dbErr } = await db
+    .from('discount_codes')
+    .update(updates)
+    .eq('id', discountId)
+    .select()
+    .single();
+
+  if (dbErr) return err(dbErr.message, 500, request, env);
+
+  await logEvent(db, 'discount', discountId, 'updated', auth.userId, updates);
+
+  return ok(data, request, env);
+}
+
+
+// ============================================================
+// HANDLER: DELETE /v2/admin/discounts/:id (Delete discount)
+// ============================================================
+async function handleAdminDeleteDiscount(
+  db: SupabaseClient, discountId: string, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  // Fetch code for logging before delete
+  const { data: existing } = await db
+    .from('discount_codes')
+    .select('id, code')
+    .eq('id', discountId)
+    .limit(1);
+
+  if (!existing || existing.length === 0) {
+    return err('Discount not found', 404, request, env);
+  }
+
+  const { error: dbErr } = await db
+    .from('discount_codes')
+    .delete()
+    .eq('id', discountId);
+
+  if (dbErr) return err(dbErr.message, 500, request, env);
+
+  await logEvent(db, 'discount', discountId, 'deleted', auth.userId, { code: existing[0].code });
+
+  return ok({ deleted: true, id: discountId }, request, env);
 }
