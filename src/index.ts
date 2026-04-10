@@ -42,7 +42,7 @@ function corsHeaders(request: Request, env: Env): Record<string, string> {
   const isAllowed = allowed.includes(origin) || allowed.includes('*');
   return {
     'Access-Control-Allow-Origin': isAllowed ? origin : allowed[0] || '',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key',
     'Access-Control-Max-Age': '86400',
   };
@@ -66,6 +66,7 @@ function err(message: string, status: number, request: Request, env: Env): Respo
 // ── Router ──
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    
     // CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders(request, env) });
@@ -118,9 +119,9 @@ export default {
       if (path === '/v2/admin/orders' && method === 'GET') {
         return handleAdminGetOrders(db, url, request, env);
       }
-      if (path === '/v2/admin/orders/approve' && method === 'POST') {
-        return handleAdminApproveOrder(db, request, env);
-      }
+      // if (path === '/v2/admin/orders/approve' && method === 'POST') {
+      //   return handleAdminApproveOrder(db, request, env);
+      // }
       if (path.startsWith('/v2/admin/orders/') && method === 'GET') {
         const ref = path.split('/v2/admin/orders/')[1];
         return handleAdminGetOrder(db, ref, request, env);
@@ -983,57 +984,57 @@ async function handlePaystackVerify(
 // ============================================================
 // HANDLER: POST /v2/admin/orders/approve  (Manual WhatsApp approval)
 // ============================================================
-async function handleAdminApproveOrder(
-  db: SupabaseClient, request: Request, env: Env,
-): Promise<Response> {
-  // TODO: Add admin auth check here (JWT from Supabase)
-  const authHeader = request.headers.get('Authorization');
-  if (!authHeader) return err('Unauthorized', 401, request, env);
+// async function handleAdminApproveOrder(
+//   db: SupabaseClient, request: Request, env: Env,
+// ): Promise<Response> {
+//   // TODO: Add admin auth check here (JWT from Supabase)
+//   const authHeader = request.headers.get('Authorization');
+//   if (!authHeader) return err('Unauthorized', 401, request, env);
 
-  const body = await request.json() as AdminApproveRequest;
-  if (!body.order_ref) return err('order_ref is required', 400, request, env);
+//   const body = await request.json() as AdminApproveRequest;
+//   if (!body.order_ref) return err('order_ref is required', 400, request, env);
 
-  // Find order
-  const { data: order, error: oErr } = await db.from('orders')
-    .select('*')
-    .eq('order_ref', body.order_ref)
-    .eq('status', 'pending_manual')
-    .single();
+//   // Find order
+//   const { data: order, error: oErr } = await db.from('orders')
+//     .select('*')
+//     .eq('order_ref', body.order_ref)
+//     .eq('status', 'pending_manual')
+//     .single();
 
-  if (oErr || !order) {
-    return err('Order not found or not in pending_manual status', 404, request, env);
-  }
+//   if (oErr || !order) {
+//     return err('Order not found or not in pending_manual status', 404, request, env);
+//   }
 
-  // Update payment method if provided
-  if (body.payment_method) {
-    await db.from('orders').update({
-      payment_method: body.payment_method,
-      notes: body.notes || null,
-    }).eq('id', order.id);
-  }
+//   // Update payment method if provided
+//   if (body.payment_method) {
+//     await db.from('orders').update({
+//       payment_method: body.payment_method,
+//       notes: body.notes || null,
+//     }).eq('id', order.id);
+//   }
 
-  // Record payment event for idempotency
-  const manualRef = `MANUAL-${order.order_ref}-${Date.now()}`;
-  await db.from('payment_events').insert({
-    payment_reference: manualRef,
-    order_id: order.id,
-    status: 'success',
-    amount_ngn: order.total_ngn,
-    provider: 'manual',
-    raw_payload: { approved_by: 'admin', method: body.payment_method, notes: body.notes },
-  });
+//   // Record payment event for idempotency
+//   const manualRef = `MANUAL-${order.order_ref}-${Date.now()}`;
+//   await db.from('payment_events').insert({
+//     payment_reference: manualRef,
+//     order_id: order.id,
+//     status: 'success',
+//     amount_ngn: order.total_ngn,
+//     provider: 'manual',
+//     raw_payload: { approved_by: 'admin', method: body.payment_method, notes: body.notes },
+//   });
 
-  // Fulfill (same pipeline as Paystack)
-  await fulfillOrder(db, order.id, body.payment_method || 'cash', env);
+//   // Fulfill (same pipeline as Paystack)
+//   await fulfillOrder(db, order.id, body.payment_method || 'cash', env);
 
-  await logEvent(db, 'order', order.id, 'approved_manual', null, {
-    order_ref: order.order_ref,
-    payment_method: body.payment_method,
-    notes: body.notes,
-  });
+//   await logEvent(db, 'order', order.id, 'approved_manual', null, {
+//     order_ref: order.order_ref,
+//     payment_method: body.payment_method,
+//     notes: body.notes,
+//   });
 
-  return ok({ approved: true, order_ref: order.order_ref }, request, env);
-}
+//   return ok({ approved: true, order_ref: order.order_ref }, request, env);
+// }
 
 
 // ============================================================
@@ -1128,6 +1129,8 @@ async function fulfillOrder(
 
   if (!order) return;
 
+  console.log('Fulfillment started:', orderId);
+  
   // 3. Increment discount usage
   if (order.discount_code) {
     const { data: disc } = await db.from('discount_codes')
@@ -1484,7 +1487,7 @@ async function handleAdminApproveOrderV2(
   if (!auth.ok) return auth.response;
 
   const body = await request.json().catch(() => ({})) as any;
-  const paymentMethod = body.payment_method || 'manual';
+  const paymentMethod = 'whatsapp';
 
   const { data: order, error: findErr } = await db
     .from('orders')
@@ -1496,12 +1499,51 @@ async function handleAdminApproveOrderV2(
   if (order.status !== 'pending_manual') return err(`Cannot approve — status is "${order.status}"`, 400, request, env);
 
   // Use fulfillOrder pipeline
-  await fulfillOrder(db, order.id, paymentMethod, env);
+  // 🔴 force update BEFORE fulfill (guarantees persistence)
+  await db.from('orders').update({
+    status: 'paid',
+    payment_method: paymentMethod,
+    paid_at: new Date().toISOString(),
+  }).eq('id', order.id);
+
+  // then run rest of pipeline
+  // 🔍 STEP A — force update + log result
+const { data: updated, error: updateErr } = await db
+.from('orders')
+.update({
+  status: 'paid',
+  payment_method: paymentMethod,
+  paid_at: new Date().toISOString(),
+})
+.eq('id', order.id)
+.select()
+.single();
+
+console.log('UPDATE RESULT:', updated, updateErr);
+
+// 🔴 STOP if update failed
+if (updateErr || !updated) {
+return err('Failed to update order status', 500, request, env);
+}
+
+// 🔍 STEP B — re-fetch immediately
+const { data: check } = await db
+.from('orders')
+.select('status')
+.eq('id', order.id)
+.single();
+
+console.log('AFTER UPDATE STATUS:', check?.status);
+
+// continue pipeline
+await fulfillOrder(db, order.id, paymentMethod, env);
 
   await logEvent(db, 'order', order.id, 'approved_manual_v2', auth.userId, {
     order_ref: order.order_ref,
     payment_method: paymentMethod,
   });
+
+  console.log('Approving order:', ref);
 
   return ok({ approved: true, order_ref: ref }, request, env);
 }
@@ -2617,3 +2659,4 @@ async function handleAdminDeleteDiscount(
 
   return ok({ deleted: true, id: discountId }, request, env);
 }
+
