@@ -1560,7 +1560,7 @@ async function handleAdminRejectOrder(
 
   const { data: order, error: findErr } = await db
     .from('orders')
-    .select('id, status, order_ref')
+    .select('id, status, order_ref, notes')
     .eq('order_ref', ref)
     .single();
 
@@ -2242,18 +2242,28 @@ async function handleAdClick(
   const body = await request.json().catch(() => ({})) as any;
   if (!body.ad_id) return err('ad_id required', 400, request, env);
  
-  await db.from('ads')
-    .update({ click_count: db.rpc ? undefined : 0 }) // fallback
-    .eq('id', body.ad_id);
+  // await db.from('ads')
+  //   .update({ click_count: db.rpc ? undefined : 0 }) // fallback
+  //   .eq('id', body.ad_id);
  
   // Increment click_count using raw SQL via rpc or direct update
-  await db.rpc('increment_ad_click', { p_ad_id: body.ad_id }).catch(async () => {
+  const { error: rpcErr } = await db.rpc('increment_ad_click', { p_ad_id: body.ad_id });
+
+  if (rpcErr) {
     // Fallback: manual increment
-    const { data: ad } = await db.from('ads').select('click_count').eq('id', body.ad_id).single();
+    const { data: ad } = await db
+      .from('ads')
+      .select('click_count')
+      .eq('id', body.ad_id)
+      .single();
+
     if (ad) {
-      await db.from('ads').update({ click_count: (ad.click_count || 0) + 1 }).eq('id', body.ad_id);
+      await db
+        .from('ads')
+        .update({ click_count: (ad.click_count || 0) + 1 })
+        .eq('id', body.ad_id);
     }
-  });
+  }
  
   return ok({ tracked: true }, request, env);
 }
