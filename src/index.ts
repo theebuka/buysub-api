@@ -224,6 +224,125 @@ export default {
         return handleValidateDiscountV2(db, url, request, env);
       }
 
+      // ── Notifications ──
+      if (path === '/v2/admin/notifications' && method === 'POST') {
+        const auth = await requireAdmin(db, request, env);
+        if (!auth.ok) return auth.response;
+
+        const body = await request.json().catch(() => null) as any;
+
+        if (!body?.type || (!body?.steps?.length && !body?.message)) {
+          return err('Message or steps required', 400, request, env);
+        }
+
+        const { data, error } = await db
+          .from('notifications')
+          .insert([{
+            title: body.title || null,
+            message: body.steps?.length ? null : body.message,
+            type: body.type,
+            active: true,
+            audience: body.audience || 'all',
+            image_url: body.image_url || null,
+            image_position: body.image_position || 'top',
+            steps: body.steps?.length ? body.steps : null,
+            scheduled_for: body.scheduled_for || null,
+            expires_at: body.expires_at || null,
+          }])
+          .select()
+          .single();
+
+        if (error) return err(error.message, 500, request, env);
+
+        return ok(data, request, env);
+      }
+
+      if (path === '/v2/notifications' && method === 'GET') {
+        const now = new Date().toISOString()
+      
+        // extract user (if logged in)
+        const token = request.headers.get('Authorization')?.replace('Bearer ', '')
+        let role = 'public'
+      
+        if (token) {
+          const { data: userData } = await db.auth.getUser(token)
+          const userId = userData?.user?.id
+      
+          if (userId) {
+            const { data: profile } = await db
+              .from('profiles')
+              .select('role')
+              .eq('id', userId)
+              .single()
+      
+            role = profile?.role === 'admin' ? 'admins' : 'users'
+          }
+        }
+      
+        const { data, error } = await db
+          .from('notifications')
+          .select('*')
+          .eq('active', true)
+          .in('audience', ['all', 'users', 'admins'])
+
+        if (error) return err(error.message, 500, request, env)
+
+        // ✅ filter in JS (this is the fix)
+        const filtered = (data || []).filter((n: any) => {
+          const scheduledOk =
+            !n.scheduled_for || n.scheduled_for <= now
+
+          const expiryOk =
+            !n.expires_at || n.expires_at > now
+
+          return scheduledOk && expiryOk
+        })
+
+        return ok(
+          filtered
+            .sort((a: any, b: any) =>
+              new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+            )
+            .slice(0, 5),
+          request,
+          env
+        )
+      }
+
+      if (path === '/v2/admin/notifications' && method === 'GET') {
+        const auth = await requireAdmin(db, request, env)
+        if (!auth.ok) return auth.response
+      
+        const { data, error } = await db
+          .from('notifications')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(50)
+      
+        if (error) return err(error.message, 500, request, env)
+      
+        return ok(data, request, env)
+      }
+
+      if (path.startsWith('/v2/admin/notifications/') && method === 'PUT') {
+        const auth = await requireAdmin(db, request, env)
+        if (!auth.ok) return auth.response
+      
+        const id = path.split('/').pop()
+        const body = await request.json().catch(() => null) as any
+      
+        const { data, error } = await db
+          .from('notifications')
+          .update({ active: body.active })
+          .eq('id', id)
+          .select()
+          .single()
+      
+        if (error) return err(error.message, 500, request, env)
+      
+        return ok(data, request, env)
+      }
+
 // ════════════════════════════════════════════════════════
       // PHASE 4 ROUTES — Affiliates, Short Links, Ads
       // ════════════════════════════════════════════════════════
@@ -261,24 +380,21 @@ export default {
       }
  
       // ── Short Links (admin) ──
-      if (path === '/v2/admin/links' && method === 'GET') {
-        return handleAdminGetLinks(db, url, request, env);
-      }
-      if (path === '/v2/admin/links' && method === 'POST') {
-        return handleAdminCreateLink(db, request, env);
-      }
-      if (path.match(/^\/v2\/admin\/links\/[^/]+$/) && method === 'PATCH') {
-        const id = path.split('/')[4];
-        return handleAdminUpdateLink(db, id, request, env);
-      }
-      if (path.match(/^\/v2\/admin\/links\/[^/]+$/) && method === 'DELETE') {
-        const id = path.split('/')[4];
-        return handleAdminDeleteLink(db, id, request, env);
-      }
-      if (path.match(/^\/v2\/admin\/links\/[^/]+\/stats$/) && method === 'GET') {
-        const id = path.split('/')[4];
-        return handleAdminLinkStats(db, id, request, env);
-      }
+      if (path === '/v2/admin/links' && method === 'GET')   return handleAdminGetLinks(db, url, request, env);
+      if (path === '/v2/admin/links' && method === 'POST')  return handleAdminCreateLink(db, request, env);
+      const linkMatch = path.match(/^\/v2\/admin\/links\/([^/]+)$/);
+      if (linkMatch && method === 'GET')    return handleAdminGetLink(db, linkMatch[1], request, env);
+      if (linkMatch && method === 'PATCH')  return handleAdminUpdateLink(db, linkMatch[1], request, env);
+      if (linkMatch && method === 'DELETE') return handleAdminDeleteLink(db, linkMatch[1], request, env);
+      const statsMatch = path.match(/^\/v2\/admin\/links\/([^/]+)\/stats$/);
+      if (statsMatch && method === 'GET')   return handleAdminLinkStats(db, statsMatch[1], request, env);
+      const rulesMatch = path.match(/^\/v2\/admin\/links\/([^/]+)\/rules$/);
+      if (rulesMatch && method === 'GET')   return handleAdminGetLinkRules(db, rulesMatch[1], request, env);
+      if (rulesMatch && method === 'POST')  return handleAdminCreateLinkRule(db, rulesMatch[1], request, env);
+      const ruleMatch = path.match(/^\/v2\/admin\/links\/[^/]+\/rules\/([^/]+)$/);
+      if (ruleMatch && method === 'PATCH')  return handleAdminUpdateLinkRule(db, ruleMatch[1], request, env);
+      if (ruleMatch && method === 'DELETE') return handleAdminDeleteLinkRule(db, ruleMatch[1], request, env);
+
  
       // ── Ads (public — get ads for a placement) ──
       if (path === '/v2/ads' && method === 'GET') {
@@ -740,11 +856,11 @@ async function handleWhatsAppOrder(
     const lines: string[] = [
       `🛒 *New WhatsApp Order*`,
       ``,
-      `📋 Order Ref: *${orderRef}*`,
-      `📧 Customer: ${body.customer_email}`,
-      body.customer_name ? `👤 Name: ${body.customer_name}` : '',
-      body.customer_phone ? `📱 Phone: ${body.customer_phone}` : '',
-      `💱 Currency: ${currency}`,
+      `Order Ref: *${orderRef}*`,
+      `Customer: ${body.customer_email}`,
+      body.customer_name ? `Name: ${body.customer_name}` : '',
+      body.customer_phone ? `Phone: ${body.customer_phone}` : '',
+      `Currency: ${currency}`,
       ``,
       `*Items:*`,
       ...body.items.map(item => {
@@ -2074,143 +2190,309 @@ async function handleAdminSuspendAffiliate(
  
  
 // ══════════════════════════════════════════════════════════
-// SHORT LINKS — Admin management
+// SHORT LINKS — Admin management (REPLACES existing handlers)
 // ══════════════════════════════════════════════════════════
- 
+//
+// What changed vs. the previous version:
+//   • POST/PATCH accept the new columns (password, cloak, hide_referrer,
+//     deep_link_*, ios_app_store_id, android_package, qr_config)
+//   • Password is SHA-256 hashed on write — never round-tripped to client.
+//     GET/LIST responses redact password_hash and return { has_password: bool }.
+//   • New endpoints for targeting-rule CRUD (short_link_rules).
+//
+// Router wiring (add to the existing router switch):
+//   if (path === '/v2/admin/links' && method === 'GET')   return handleAdminGetLinks(db, url, request, env);
+//   if (path === '/v2/admin/links' && method === 'POST')  return handleAdminCreateLink(db, request, env);
+//   const linkMatch = path.match(/^\/v2\/admin\/links\/([^/]+)$/);
+//   if (linkMatch && method === 'GET')    return handleAdminGetLink(db, linkMatch[1], request, env);
+//   if (linkMatch && method === 'PATCH')  return handleAdminUpdateLink(db, linkMatch[1], request, env);
+//   if (linkMatch && method === 'DELETE') return handleAdminDeleteLink(db, linkMatch[1], request, env);
+//   const statsMatch = path.match(/^\/v2\/admin\/links\/([^/]+)\/stats$/);
+//   if (statsMatch && method === 'GET')   return handleAdminLinkStats(db, statsMatch[1], request, env);
+//   const rulesMatch = path.match(/^\/v2\/admin\/links\/([^/]+)\/rules$/);
+//   if (rulesMatch && method === 'GET')   return handleAdminGetLinkRules(db, rulesMatch[1], request, env);
+//   if (rulesMatch && method === 'POST')  return handleAdminCreateLinkRule(db, rulesMatch[1], request, env);
+//   const ruleMatch = path.match(/^\/v2\/admin\/links\/[^/]+\/rules\/([^/]+)$/);
+//   if (ruleMatch && method === 'PATCH')  return handleAdminUpdateLinkRule(db, ruleMatch[1], request, env);
+//   if (ruleMatch && method === 'DELETE') return handleAdminDeleteLinkRule(db, ruleMatch[1], request, env);
+
+// ── Columns editable via the admin API ──
+const LINK_WRITE_FIELDS = [
+  'destination_url', 'slug',
+  'expires_at', 'click_limit',
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
+  'tags', 'active',
+  'cloak', 'hide_referrer',
+  'deep_link_ios', 'deep_link_android', 'ios_app_store_id', 'android_package',
+  'qr_config',
+];
+
+async function sha256Hex(msg: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(msg));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function redactLink(row: any) {
+  if (!row) return row;
+  const { password_hash, ...rest } = row;
+  return { ...rest, has_password: !!password_hash };
+}
+
 // ── GET /v2/admin/links?q=&page=&limit= ──
 async function handleAdminGetLinks(
   db: SupabaseClient, url: URL, request: Request, env: Env
 ): Promise<Response> {
   const auth = await requireAdmin(db, request, env);
   if (!auth.ok) return auth.response;
- 
+
   const q = url.searchParams.get('q')?.trim();
   const page = Math.max(1, parseInt(url.searchParams.get('page') || '1'));
   const limit = Math.min(50, parseInt(url.searchParams.get('limit') || '20'));
   const offset = (page - 1) * limit;
- 
+
   let query = db
     .from('short_links')
     .select('*', { count: 'exact' })
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
- 
+
   if (q) query = query.or(`slug.ilike.%${q}%,destination_url.ilike.%${q}%,tags.ilike.%${q}%`);
- 
+
   const { data, error: dbErr, count } = await query;
   if (dbErr) return err(dbErr.message, 500, request, env);
- 
-  return ok(data, request, env, {
+
+  const rows = (data || []).map(redactLink);
+  return ok(rows, request, env, {
     pagination: { page, limit, total: count, pages: Math.ceil((count || 0) / limit) }
   });
 }
- 
- 
+
+// ── GET /v2/admin/links/:id  (single link + rules) ──
+async function handleAdminGetLink(
+  db: SupabaseClient, id: string, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const { data, error: dbErr } = await db
+    .from('short_links')
+    .select('*, rules:short_link_rules(*)')
+    .eq('id', id)
+    .single();
+
+  if (dbErr) return err(dbErr.message, 500, request, env);
+  return ok(redactLink(data), request, env);
+}
+
 // ── POST /v2/admin/links ──
 async function handleAdminCreateLink(
   db: SupabaseClient, request: Request, env: Env
 ): Promise<Response> {
   const auth = await requireAdmin(db, request, env);
   if (!auth.ok) return auth.response;
- 
+
   const body = await request.json().catch(() => null) as any;
   if (!body) return err('Invalid request body', 400, request, env);
   if (!body.destination_url) return err('destination_url is required', 400, request, env);
- 
-  // Generate slug if not provided
+
   const slug = body.slug?.trim().toLowerCase() ||
     Math.random().toString(36).slice(2, 8);
- 
-  // Check slug uniqueness
+
   const { data: existing } = await db
     .from('short_links')
     .select('id')
     .eq('slug', slug)
     .single();
- 
+
   if (existing) return err(`Slug "${slug}" is already taken`, 409, request, env);
- 
+
+  const insert: Record<string, any> = { slug, active: true };
+  for (const f of LINK_WRITE_FIELDS) {
+    if (body[f] !== undefined) insert[f] = body[f];
+  }
+  insert.destination_url = body.destination_url;
+
+  // Hash password if provided
+  if (body.password) {
+    insert.password_hash = await sha256Hex(String(body.password));
+  }
+
   const { data, error: dbErr } = await db
     .from('short_links')
-    .insert({
-      slug,
-      destination_url: body.destination_url,
-      expires_at: body.expires_at || null,
-      click_limit: body.click_limit || null,
-      utm_source: body.utm_source || null,
-      utm_medium: body.utm_medium || null,
-      utm_campaign: body.utm_campaign || null,
-      tags: body.tags || null,
-      active: true,
-    })
+    .insert(insert)
     .select()
     .single();
- 
+
   if (dbErr) return err(dbErr.message, 500, request, env);
- 
-  return jsonResponse({ ok: true, data: { ...data, short_url: `https://go.buysub.ng/${data.slug}` } }, 201, request, env);
+
+  return jsonResponse(
+    { ok: true, data: { ...redactLink(data), short_url: `https://go.buysub.ng/${data.slug}` } },
+    201, request, env
+  );
 }
- 
- 
+
 // ── PATCH /v2/admin/links/:id ──
 async function handleAdminUpdateLink(
   db: SupabaseClient, id: string, request: Request, env: Env
 ): Promise<Response> {
   const auth = await requireAdmin(db, request, env);
   if (!auth.ok) return auth.response;
- 
+
   const body = await request.json().catch(() => ({})) as any;
- 
-  const allowed = ['destination_url', 'slug', 'expires_at', 'click_limit',
-    'utm_source', 'utm_medium', 'utm_campaign', 'tags', 'active'];
+
   const updates: Record<string, any> = {};
-  for (const key of allowed) {
+  for (const key of LINK_WRITE_FIELDS) {
     if (body[key] !== undefined) updates[key] = body[key];
   }
+
+  // Password handling:
+  //   body.password === string   → hash + set
+  //   body.password === null     → clear password
+  //   body.password === undefined → leave untouched
+  if (body.password !== undefined) {
+    updates.password_hash = body.password === null || body.password === ''
+      ? null
+      : await sha256Hex(String(body.password));
+  }
+
   updates.updated_at = new Date().toISOString();
- 
+
   const { data, error: dbErr } = await db
     .from('short_links')
     .update(updates)
     .eq('id', id)
     .select()
     .single();
- 
+
   if (dbErr) return err(dbErr.message, 500, request, env);
-  return ok(data, request, env);
+  return ok(redactLink(data), request, env);
 }
- 
- 
+
 // ── DELETE /v2/admin/links/:id ──
 async function handleAdminDeleteLink(
   db: SupabaseClient, id: string, request: Request, env: Env
 ): Promise<Response> {
   const auth = await requireAdmin(db, request, env);
   if (!auth.ok) return auth.response;
- 
+
   const { error: dbErr } = await db
     .from('short_links')
     .delete()
     .eq('id', id);
- 
+
   if (dbErr) return err(dbErr.message, 500, request, env);
   return ok({ deleted: true }, request, env);
 }
- 
- 
+
 // ── GET /v2/admin/links/:id/stats ──
 async function handleAdminLinkStats(
   db: SupabaseClient, id: string, request: Request, env: Env
 ): Promise<Response> {
   const auth = await requireAdmin(db, request, env);
   if (!auth.ok) return auth.response;
- 
+
   const { data, error: rpcErr } = await db.rpc('short_link_stats', { p_link_id: id });
   if (rpcErr) return err(rpcErr.message, 500, request, env);
- 
+
   return ok(data, request, env);
 }
- 
+
+// ══════════════════════════════════════════════════════════
+// TARGETING RULES
+// ══════════════════════════════════════════════════════════
+
+const RULE_WRITE_FIELDS = ['priority', 'match_type', 'match_value', 'destination_url'];
+const VALID_MATCH_TYPES = ['country', 'region', 'city', 'os'];
+
+// ── GET /v2/admin/links/:linkId/rules ──
+async function handleAdminGetLinkRules(
+  db: SupabaseClient, linkId: string, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const { data, error: dbErr } = await db
+    .from('short_link_rules')
+    .select('*')
+    .eq('link_id', linkId)
+    .order('priority', { ascending: true });
+
+  if (dbErr) return err(dbErr.message, 500, request, env);
+  return ok(data || [], request, env);
+}
+
+// ── POST /v2/admin/links/:linkId/rules ──
+async function handleAdminCreateLinkRule(
+  db: SupabaseClient, linkId: string, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await request.json().catch(() => null) as any;
+  if (!body) return err('Invalid request body', 400, request, env);
+  if (!body.match_type || !VALID_MATCH_TYPES.includes(body.match_type)) {
+    return err(`match_type must be one of: ${VALID_MATCH_TYPES.join(', ')}`, 400, request, env);
+  }
+  if (!body.match_value) return err('match_value is required', 400, request, env);
+  if (!body.destination_url) return err('destination_url is required', 400, request, env);
+
+  const insert: Record<string, any> = { link_id: linkId };
+  for (const f of RULE_WRITE_FIELDS) {
+    if (body[f] !== undefined) insert[f] = body[f];
+  }
+
+  const { data, error: dbErr } = await db
+    .from('short_link_rules')
+    .insert(insert)
+    .select()
+    .single();
+
+  if (dbErr) return err(dbErr.message, 500, request, env);
+  return jsonResponse({ ok: true, data }, 201, request, env);
+}
+
+// ── PATCH /v2/admin/links/:linkId/rules/:ruleId ──
+async function handleAdminUpdateLinkRule(
+  db: SupabaseClient, ruleId: string, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await request.json().catch(() => ({})) as any;
+  const updates: Record<string, any> = {};
+  for (const f of RULE_WRITE_FIELDS) {
+    if (body[f] !== undefined) updates[f] = body[f];
+  }
+  if (updates.match_type && !VALID_MATCH_TYPES.includes(updates.match_type)) {
+    return err(`match_type must be one of: ${VALID_MATCH_TYPES.join(', ')}`, 400, request, env);
+  }
+
+  const { data, error: dbErr } = await db
+    .from('short_link_rules')
+    .update(updates)
+    .eq('id', ruleId)
+    .select()
+    .single();
+
+  if (dbErr) return err(dbErr.message, 500, request, env);
+  return ok(data, request, env);
+}
+
+// ── DELETE /v2/admin/links/:linkId/rules/:ruleId ──
+async function handleAdminDeleteLinkRule(
+  db: SupabaseClient, ruleId: string, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const { error: dbErr } = await db
+    .from('short_link_rules')
+    .delete()
+    .eq('id', ruleId);
+
+  if (dbErr) return err(dbErr.message, 500, request, env);
+  return ok({ deleted: true }, request, env);
+} 
  
 // ══════════════════════════════════════════════════════════
 // ADS

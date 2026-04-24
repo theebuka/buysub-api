@@ -20,7 +20,7 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 FRONTEND_URL = "https://app.buysub.ng"
 WHATSAPP_NUMBER = "2348107872916"
-ALLOWED_ORIGINS = "https://app.buysub.ng,https://buysub.ng,http://localhost:3000"
+ALLOWED_ORIGINS = "https://app.buysub.ng,https://buysub.ng,http://localhost:3000,http://192.168.100.42:3000"
 
 # Routes — deploy alongside existing workers without conflict
 # The v2 prefix ensures no collision with your current proxy workers
