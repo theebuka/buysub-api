@@ -423,6 +423,17 @@ export default {
         return handleAdminDeleteAd(db, id, request, env);
       }
 
+      // Partner dashboard (self-service)
+      if (path === '/v2/partners/me' && method === 'GET') {
+        return handlePartnerMe(db, request, env);
+      }
+      if (path === '/v2/partners/me' && method === 'PATCH') {
+        return handlePartnerUpdateMe(db, request, env);
+      }
+      if (path === '/v2/partners/me/stats' && method === 'GET') {
+        return handlePartnerMyStats(db, request, env);
+      }
+
       return err('Not found', 404, request, env);
     } catch (e: any) {
       console.error('Unhandled error:', e);
@@ -843,42 +854,52 @@ async function handleWhatsAppOrder(
     await db.from('order_items').insert(orderItems);
 
     // Build WhatsApp message for admin
+    // Fetch product WA/social links for items
+    const waProductIds = body.items.map(i => i.product_id);
+    const { data: waProducts } = await db
+      .from('products')
+      .select('id, whatsapp_group_url, social_links')
+      .in('id', waProductIds);
+    const waProductMap = new Map((waProducts || []).map((p: any) => [p.id, p]));
+    
     const fxRate = body.fx_rate || 1;
     const currency = body.currency || 'NGN';
     const fmtAmt = (v: number) => {
       if (currency === 'NGN') return `₦${Math.ceil(v).toLocaleString()}`;
       return `${currency} ${(v * fxRate).toFixed(2)}`;
     };
-
+    
     const whatsappNumber = env.WHATSAPP_NUMBER || '2348107872916';
     const frontendUrl = env.FRONTEND_URL || 'https://app.buysub.ng';
-
+    
     const lines: string[] = [
-      `🛒 *New WhatsApp Order*`,
-      ``,
+      `🛒 *New WhatsApp Order*`, ``,
       `Order Ref: *${orderRef}*`,
       `Customer: ${body.customer_email}`,
       body.customer_name ? `Name: ${body.customer_name}` : '',
       body.customer_phone ? `Phone: ${body.customer_phone}` : '',
-      `Currency: ${currency}`,
-      ``,
+      `Currency: ${currency}`, ``,
       `*Items:*`,
-      ...body.items.map(item => {
-        const lineTotal = item.unit_price_ngn * item.quantity;
-        return `• ${item.product_name} ×${item.quantity} (${item.billing_period}) — ${fmtAmt(lineTotal)}`;
-      }),
-      ``,
     ];
-
+    
+    for (const item of body.items) {
+      const lineTotal = item.unit_price_ngn * item.quantity;
+      lines.push(`• ${item.product_name} ×${item.quantity} (${item.billing_period}) — ${fmtAmt(lineTotal)}`);
+      const p: any = waProductMap.get(item.product_id);
+      if (p?.whatsapp_group_url) {
+        lines.push(`   └ Group: ${p.whatsapp_group_url}`);
+      }
+    }
+    lines.push(``);
+    
     if (discountNGN > 0 && discountCode) {
       lines.push(`Subtotal: ${fmtAmt(serverSubtotal)}`);
       lines.push(`Promo (${discountCode}): -${fmtAmt(discountNGN)}`);
     }
-    lines.push(`*Total: ${fmtAmt(totalNGN)}*`);
-    lines.push(``);
+    lines.push(`*Total: ${fmtAmt(totalNGN)}*`, ``);
     lines.push(`⚠️ Status: Pending Manual Approval`);
     lines.push(`Approve at: ${frontendUrl}/admin/orders/${orderRef}`);
-
+    
     const message = lines.filter(Boolean).join('\n');
     const whatsappUrl = `https://wa.me/${whatsappNumber}?text=${encodeURIComponent(message)}`;
 
@@ -1314,44 +1335,244 @@ async function fulfillOrder(
 // ============================================================
 async function sendConfirmationEmail(order: any, env: Env): Promise<void> {
   const items = order.order_items || [];
-  const itemRows = items.map((item: any) =>
-    `<tr>
-      <td style="padding:8px 12px;border-bottom:1px solid #eee;">${item.product_name}</td>
-      <td style="padding:8px 12px;border-bottom:1px solid #eee;">${item.billing_period || 'One-time'}</td>
-      <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:center;">${item.quantity}</td>
-      <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">₦${Number(item.total_price_ngn).toLocaleString()}</td>
-    </tr>`
-  ).join('');
+ 
+  // Collect distinct product ids and fetch their WA/social links
+  const productIds = [...new Set(items.map((i: any) => i.product_id).filter(Boolean))];
+  let productLinks: Record<string, { whatsapp_group_url?: string; social_links?: any; name?: string }> = {};
+  if (productIds.length) {
+    try {
+      const db = createClient(env.SUPABASE_URL!, env.SUPABASE_SERVICE_ROLE_KEY!, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+      const { data } = await db
+        .from('products')
+        .select('id, name, whatsapp_group_url, social_links')
+        .in('id', productIds);
+      for (const p of data || []) productLinks[p.id] = p;
+    } catch (e) { console.error('product-links fetch failed:', e); }
+  }
+ 
+  // Build PDF receipt and base64-encode it for Resend attachment
+  let pdfBase64: string | null = null;
+  try {
+    const pdfBytes = await buildReceiptPdf(order);
+    pdfBase64 = bytesToBase64(pdfBytes);
+  } catch (e) {
+    console.error('PDF build failed, sending without attachment:', e);
+  }
+ 
+  const html = buildOrderEmailHtml(order, items, productLinks);
+ 
+  const payload: any = {
+    from: 'BuySub <noreply@buysub.ng>',
+    to: [order.customer_email],
+    subject: `Your BuySub receipt — ${order.order_ref}`,
+    html,
+  };
+  if (pdfBase64) {
+    payload.attachments = [{
+      filename: `BuySub-Receipt-${order.order_ref}.pdf`,
+      content: pdfBase64,
+    }];
+  }
+ 
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    console.error('resend error:', res.status, text);
+  }
+}
 
-  const html = `
-    <div style="font-family:Inter,system-ui,sans-serif;max-width:600px;margin:0 auto;padding:32px 24px;color:#1a1a1a;">
-      <div style="text-align:center;margin-bottom:32px;">
-        <h1 style="font-size:22px;font-weight:700;margin:0;">Order Confirmed!</h1>
-        <p style="font-size:14px;color:#666;margin:8px 0 0;">Ref: ${order.order_ref}</p>
-      </div>
-      <p style="font-size:14px;line-height:1.6;">Hi ${order.customer_name || 'there'},</p>
-      <p style="font-size:14px;line-height:1.6;">Thank you for your purchase with BuySub. Here's your order summary:</p>
-      <table style="width:100%;border-collapse:collapse;margin:20px 0;">
-        <thead>
-          <tr style="background:#2a2a34;color:#fff;">
-            <th style="padding:10px 12px;text-align:left;font-size:13px;">Item</th>
-            <th style="padding:10px 12px;text-align:left;font-size:13px;">Period</th>
-            <th style="padding:10px 12px;text-align:center;font-size:13px;">Qty</th>
-            <th style="padding:10px 12px;text-align:right;font-size:13px;">Amount</th>
-          </tr>
-        </thead>
-        <tbody>${itemRows}</tbody>
-      </table>
-      ${order.discount_ngn > 0 ? `<p style="font-size:14px;">Subtotal: ₦${Number(order.subtotal_ngn).toLocaleString()}<br/>Discount (${order.discount_code}): -₦${Number(order.discount_ngn).toLocaleString()}</p>` : ''}
-      <p style="font-size:18px;font-weight:700;">Total: ₦${Number(order.total_ngn).toLocaleString()}</p>
-      <p style="font-size:14px;line-height:1.6;">We'll be in touch with your subscription details shortly.</p>
-      <hr style="border:none;border-top:1px solid #eee;margin:24px 0;"/>
-      <p style="font-size:12px;color:#999;text-align:center;">
-        BuySub · <a href="https://buysub.ng" style="color:#7C5CFF;">buysub.ng</a> · help@buysub.ng
-      </p>
-    </div>
-  `;
-
+function buildOrderEmailHtml(
+  order: any,
+  items: any[],
+  productLinks: Record<string, { whatsapp_group_url?: string; social_links?: any; name?: string }>
+): string {
+  const fmt = (n: number) => `₦${Number(n || 0).toLocaleString('en-NG')}`;
+  const customerName = order.customer_name || 'there';
+ 
+  // Per-product CTA section. Only products that have a WA group or
+  // any social link show a card.
+  const productCards = items.map((it: any) => {
+    const p = productLinks[it.product_id];
+    if (!p) return '';
+    const sl = p.social_links || {};
+    const links: { label: string; url: string; kind: string }[] = [];
+    if (p.whatsapp_group_url) links.push({ label: 'Join WhatsApp Group', url: p.whatsapp_group_url, kind: 'whatsapp' });
+    if (sl.telegram)           links.push({ label: 'Telegram',            url: sl.telegram,           kind: 'telegram'  });
+    if (sl.instagram)          links.push({ label: 'Instagram',           url: sl.instagram,          kind: 'instagram' });
+    if (sl.twitter)            links.push({ label: 'Twitter / X',         url: sl.twitter,            kind: 'twitter'   });
+    if (sl.discord)            links.push({ label: 'Discord',             url: sl.discord,            kind: 'discord'   });
+    if (sl.website)            links.push({ label: 'Website',             url: sl.website,            kind: 'web'       });
+    if (!links.length) return '';
+ 
+    const linkButtons = links.map(l => `
+      <a href="${escHtml(l.url)}" target="_blank" rel="noopener"
+         style="display:inline-block;margin:4px 4px 0 0;padding:8px 14px;border-radius:8px;background:#1a1a20;border:1px solid #2a2a32;color:#e8e8ec;font-size:13px;font-weight:500;text-decoration:none;">
+        ${escHtml(l.label)}
+      </a>`).join('');
+ 
+    return `
+      <tr><td style="padding:16px 0 0;">
+        <div style="background:#0f0f14;border:1px solid #1c1c22;border-radius:12px;padding:16px 18px;">
+          <div style="font-size:12px;color:#9b82ff;text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Next steps for ${escHtml(p.name || it.product_name)}</div>
+          <div style="margin-top:10px;">${linkButtons}</div>
+        </div>
+      </td></tr>`;
+  }).join('');
+ 
+  const itemRows = items.map((it: any) => `
+    <tr>
+      <td style="padding:12px 0;border-bottom:1px solid #1c1c22;">
+        <div style="color:#e8e8ec;font-size:14px;font-weight:500;">${escHtml(it.product_name)}</div>
+        <div style="color:#a0a0b0;font-size:12px;margin-top:2px;">${escHtml(it.billing_period || 'One-time')} · ×${it.quantity}</div>
+      </td>
+      <td style="padding:12px 0;border-bottom:1px solid #1c1c22;text-align:right;color:#e8e8ec;font-size:14px;font-weight:600;white-space:nowrap;">
+        ${fmt(it.total_price_ngn)}
+      </td>
+    </tr>`).join('');
+ 
+  const discountRow = order.discount_ngn > 0 ? `
+    <tr>
+      <td style="padding:6px 0;color:#a0a0b0;font-size:13px;">Discount${order.discount_code ? ` (${escHtml(order.discount_code)})` : ''}</td>
+      <td style="padding:6px 0;color:#22c55e;font-size:13px;text-align:right;">-${fmt(order.discount_ngn)}</td>
+    </tr>` : '';
+ 
+  const subtotalRow = order.discount_ngn > 0 ? `
+    <tr>
+      <td style="padding:6px 0;color:#a0a0b0;font-size:13px;">Subtotal</td>
+      <td style="padding:6px 0;color:#a0a0b0;font-size:13px;text-align:right;">${fmt(order.subtotal_ngn)}</td>
+    </tr>` : '';
+ 
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BuySub receipt</title>
+  </head>
+  <body style="margin:0;padding:0;background:#0a0a0c;font-family:'Inter',-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0c;">
+      <tr><td align="center" style="padding:32px 16px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#111114;border:1px solid #1c1c22;border-radius:20px;overflow:hidden;">
+ 
+          <!-- Header -->
+          <tr><td style="padding:32px 32px 24px;background:linear-gradient(135deg,#1a1432 0%,#0e0a1f 100%);">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+              <tr>
+                <td>
+                  <div style="display:inline-block;width:42px;height:42px;border-radius:12px;background:#7C5CFF;color:#fff;font-weight:700;font-size:22px;line-height:42px;text-align:center;box-shadow:0 6px 22px rgba(124,92,255,0.35);">B</div>
+                </td>
+                <td style="text-align:right;">
+                  <span style="display:inline-block;padding:6px 12px;border-radius:999px;background:rgba(34,197,94,0.12);border:1px solid rgba(34,197,94,0.3);color:#22c55e;font-size:11px;font-weight:600;letter-spacing:0.04em;">✓ CONFIRMED</span>
+                </td>
+              </tr>
+            </table>
+            <div style="margin-top:24px;color:#e8e8ec;font-size:24px;font-weight:700;letter-spacing:-0.02em;">Payment received</div>
+            <div style="margin-top:6px;color:#a0a0b0;font-size:14px;">Order <span style="color:#e8e8ec;font-family:'SF Mono',Menlo,monospace;">${escHtml(order.order_ref)}</span></div>
+          </td></tr>
+ 
+          <!-- Body -->
+          <tr><td style="padding:28px 32px 8px;">
+            <p style="margin:0 0 16px;color:#e8e8ec;font-size:15px;line-height:1.6;">Hi ${escHtml(customerName)},</p>
+            <p style="margin:0 0 24px;color:#a0a0b0;font-size:14px;line-height:1.7;">
+              Thanks for your purchase. Your receipt is attached as a PDF and your full order summary is below.
+              We'll reach out shortly with subscription details.
+            </p>
+ 
+            <!-- Items -->
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #1c1c22;">
+              ${itemRows}
+            </table>
+ 
+            <!-- Totals -->
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:10px;">
+              ${subtotalRow}
+              ${discountRow}
+              <tr>
+                <td style="padding:14px 0 0;color:#e8e8ec;font-size:16px;font-weight:700;">Total paid</td>
+                <td style="padding:14px 0 0;color:#7C5CFF;font-size:20px;font-weight:700;text-align:right;">${fmt(order.total_ngn)}</td>
+              </tr>
+            </table>
+ 
+            <!-- Product-specific CTAs -->
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+              ${productCards}
+            </table>
+ 
+          </td></tr>
+ 
+          <!-- Footer -->
+          <tr><td style="padding:24px 32px 32px;border-top:1px solid #1c1c22;margin-top:24px;">
+            <p style="margin:0;color:#6b6b7e;font-size:12px;line-height:1.7;">
+              Need help? Reply to this email or message us on
+              <a href="https://wa.me/2348107872916" style="color:#7C5CFF;text-decoration:none;">WhatsApp</a>.
+            </p>
+            <p style="margin:10px 0 0;color:#6b6b7e;font-size:11px;">
+              BuySub · <a href="https://buysub.ng" style="color:#7C5CFF;text-decoration:none;">buysub.ng</a>
+            </p>
+          </td></tr>
+ 
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>`;
+}
+ 
+ 
+/* ══════════════════════════════════════════════════════════════════
+   PART 5c — Partner signup welcome email (F4)
+   ══════════════════════════════════════════════════════════════════ */
+ 
+async function sendPartnerSignupEmail(
+  args: { to: string; ownerName: string; storeName: string },
+  env: Env
+): Promise<void> {
+  const html = `<!DOCTYPE html>
+<html>
+  <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Welcome to BuySub Partners</title></head>
+  <body style="margin:0;padding:0;background:#0a0a0c;font-family:'Inter',-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0c;">
+      <tr><td align="center" style="padding:32px 16px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#111114;border:1px solid #1c1c22;border-radius:20px;overflow:hidden;">
+          <tr><td style="padding:40px 32px 28px;background:linear-gradient(135deg,#1a1432 0%,#0e0a1f 100%);text-align:center;">
+            <div style="display:inline-block;width:56px;height:56px;border-radius:16px;background:#7C5CFF;color:#fff;font-weight:700;font-size:28px;line-height:56px;text-align:center;box-shadow:0 6px 22px rgba(124,92,255,0.4);">B</div>
+            <div style="margin-top:20px;color:#e8e8ec;font-size:24px;font-weight:700;letter-spacing:-0.02em;">Welcome aboard</div>
+            <div style="margin-top:6px;color:#a0a0b0;font-size:14px;">We've received your application</div>
+          </td></tr>
+          <tr><td style="padding:28px 32px;">
+            <p style="margin:0 0 16px;color:#e8e8ec;font-size:15px;line-height:1.6;">Hi ${escHtml(args.ownerName)},</p>
+            <p style="margin:0 0 16px;color:#a0a0b0;font-size:14px;line-height:1.7;">
+              Thanks for applying to the BuySub Partner Program for <strong style="color:#e8e8ec;">${escHtml(args.storeName)}</strong>.
+              Our team will review your application within <strong style="color:#e8e8ec;">3–5 business days</strong> and get back to you via your preferred contact method.
+            </p>
+            <p style="margin:0 0 24px;color:#a0a0b0;font-size:14px;line-height:1.7;">
+              Once approved, you can log in to your partner dashboard to view affiliate stats, track earnings, and manage your profile.
+            </p>
+            <div style="text-align:center;margin:24px 0 8px;">
+              <a href="https://app.buysub.ng/login" style="display:inline-block;padding:14px 28px;border-radius:10px;background:#7C5CFF;color:#fff;font-size:14px;font-weight:600;text-decoration:none;box-shadow:0 6px 20px rgba(124,92,255,0.35);">Go to dashboard</a>
+            </div>
+          </td></tr>
+          <tr><td style="padding:20px 32px 32px;border-top:1px solid #1c1c22;">
+            <p style="margin:0;color:#6b6b7e;font-size:12px;line-height:1.7;">
+              Questions? Message us on <a href="https://wa.me/2348107872916" style="color:#7C5CFF;text-decoration:none;">WhatsApp</a> or reply to this email.
+            </p>
+            <p style="margin:10px 0 0;color:#6b6b7e;font-size:11px;">BuySub · <a href="https://buysub.ng" style="color:#7C5CFF;text-decoration:none;">buysub.ng</a></p>
+          </td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>`;
+ 
   await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
@@ -1359,9 +1580,9 @@ async function sendConfirmationEmail(order: any, env: Env): Promise<void> {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      from: 'BuySub <noreply@buysub.ng>',
-      to: [order.customer_email],
-      subject: `Order Confirmed — ${order.order_ref}`,
+      from: 'BuySub Partners <partners@buysub.ng>',
+      to: [args.to],
+      subject: `Welcome to BuySub Partners — ${args.storeName}`,
       html,
     }),
   });
@@ -1577,7 +1798,7 @@ async function handleAdminUpdateProduct(
   const allowed = [
     'name', 'slug', 'status', 'stock_status', 'price_1m', 'price_3m', 'price_6m', 'price_1y',
     'category', 'tags', 'short_description', 'description', 'category_tagline',
-    'domain', 'billing_type', 'billing_period', 'featured', 'sort_order', 'image_url',
+    'domain', 'billing_type', 'billing_period', 'featured', 'sort_order', 'image_url', 'whatsapp_group_url', 'social_links'
   ];
   const updates: Record<string, any> = {};
   for (const key of allowed) {
@@ -1720,16 +1941,21 @@ async function handleSubmitPartnerApplication(
 ): Promise<Response> {
   const body = await request.json().catch(() => null) as any;
   if (!body) return err('Invalid request body', 400, request, env);
-
+ 
   const required = [
     'legal_name', 'store_name', 'address', 'lga', 'state',
     'business_phone', 'business_email', 'owner_name', 'owner_email',
     'owner_phone', 'payout_frequency', 'payout_method',
+    'password',
   ];
   for (const field of required) {
     if (!body[field]) return err(`Missing required field: ${field}`, 400, request, env);
   }
-
+ 
+  if (typeof body.password !== 'string' || body.password.length < 8) {
+    return err('Password must be at least 8 characters', 400, request, env);
+  }
+ 
   if (body.payout_method === 'Bank Transfer') {
     if (!body.bank_name || !body.account_name || !body.account_number)
       return err('Bank details required for Bank Transfer', 400, request, env);
@@ -1741,10 +1967,33 @@ async function handleSubmitPartnerApplication(
   if (!body.aml_accepted || !body.privacy_accepted || !body.terms_accepted) {
     return err('All compliance checkboxes must be accepted', 400, request, env);
   }
-
+ 
+  // Create Supabase auth user (email_confirm false so we don't need SMTP from here).
+  // If the email is already registered, return a helpful error.
+  const { data: signUp, error: signUpErr } = await db.auth.admin.createUser({
+    email: body.owner_email,
+    password: body.password,
+    email_confirm: true,
+    user_metadata: {
+      full_name: body.owner_name,
+      role: 'partner_applicant',
+    },
+  });
+ 
+  if (signUpErr || !signUp?.user) {
+    const msg = signUpErr?.message || 'Could not create account';
+    if (/already|exists|registered/i.test(msg)) {
+      return err('An account already exists for this email. Please log in.', 409, request, env);
+    }
+    return err(msg, 500, request, env);
+  }
+ 
+  const userId = signUp.user.id;
+ 
   const { data, error: dbErr } = await db
     .from('partner_applications')
     .insert({
+      user_id: userId,
       legal_name: body.legal_name,
       store_name: body.store_name,
       address: body.address,
@@ -1777,15 +2026,33 @@ async function handleSubmitPartnerApplication(
     })
     .select('id, status')
     .single();
-
-  if (dbErr) return err(dbErr.message, 500, request, env);
-
-  await logEvent(db, 'partner_application', data.id, 'submitted', null, {
+ 
+  if (dbErr) {
+    // Roll back the auth user we just created
+    try { await db.auth.admin.deleteUser(userId); } catch { /* ignore */ }
+    return err(dbErr.message, 500, request, env);
+  }
+ 
+  await logEvent(db, 'partner_application', data.id, 'submitted', userId, {
     legal_name: body.legal_name,
     business_email: body.business_email,
   });
-
-  return jsonResponse({ ok: true, data: { id: data.id, status: data.status } }, 201, request, env);
+ 
+  // Fire-and-forget welcome email (F4)
+  try {
+    await sendPartnerSignupEmail({
+      to: body.owner_email,
+      ownerName: body.owner_name,
+      storeName: body.store_name,
+    }, env);
+  } catch (e) {
+    console.error('partner welcome email failed:', e);
+  }
+ 
+  return jsonResponse(
+    { ok: true, data: { id: data.id, status: data.status, user_id: userId } },
+    201, request, env
+  );
 }
 
 async function handleAdminPartners(
@@ -1820,10 +2087,10 @@ async function handleAdminApprovePartner(
 ): Promise<Response> {
   const auth = await requireAdmin(db, request, env);
   if (!auth.ok) return auth.response;
-
+ 
   const body = await request.json().catch(() => ({})) as any;
-
-  const { data, error: dbErr } = await db
+ 
+  const { data: app, error: appErr } = await db
     .from('partner_applications')
     .update({
       status: 'approved',
@@ -1835,11 +2102,44 @@ async function handleAdminApprovePartner(
     .eq('status', 'pending_review')
     .select()
     .single();
-
-  if (dbErr || !data) return err('Application not found or already reviewed', 404, request, env);
-
+ 
+  if (appErr || !app) return err('Application not found or already reviewed', 404, request, env);
+ 
+  // Create affiliate record if one doesn't already exist for this user
+  if (app.user_id) {
+    const { data: existing } = await db
+      .from('affiliates')
+      .select('id')
+      .eq('user_id', app.user_id)
+      .maybeSingle();
+ 
+    if (!existing) {
+      // Generate a unique short referral code from the store name
+      const base = String(app.store_name || app.owner_name || 'partner')
+        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 16);
+      const suffix = Math.random().toString(36).slice(2, 6);
+      const referralCode = `${base}-${suffix}`;
+ 
+      await db.from('affiliates').insert({
+        user_id: app.user_id,
+        partner_application_id: app.id,
+        referral_code: referralCode,
+        status: 'approved',
+        display_name: app.store_name || app.owner_name,
+        email: app.owner_email,
+      });
+    }
+ 
+    // Promote the auth user's role to 'partner'
+    try {
+      await db.auth.admin.updateUserById(app.user_id, {
+        user_metadata: { role: 'partner' },
+      });
+    } catch { /* non-fatal */ }
+  }
+ 
   await logEvent(db, 'partner_application', id, 'approved', auth.userId, {});
-  return ok(data, request, env);
+  return ok(app, request, env);
 }
 
 async function handleAdminRejectPartner(
@@ -1868,6 +2168,94 @@ async function handleAdminRejectPartner(
   await logEvent(db, 'partner_application', id, 'rejected', auth.userId, {
     reason: body.notes || body.reason,
   });
+  return ok(data, request, env);
+}
+
+async function handlePartnerMe(
+  db: SupabaseClient, request: Request, env: Env
+): Promise<Response> {
+  const token = request.headers.get('Authorization')?.replace('Bearer ', '');
+  if (!token) return err('Unauthorized', 401, request, env);
+ 
+  const { data: { user } } = await db.auth.getUser(token);
+  if (!user) return err('Invalid token', 401, request, env);
+ 
+  const { data: app } = await db
+    .from('partner_applications')
+    .select('*')
+    .eq('user_id', user.id)
+    .single();
+ 
+  if (!app) return err('No partner profile found', 404, request, env);
+ 
+  // Also fetch affiliate record (for referral code, etc.) if approved
+  let affiliate: any = null;
+  if (app.status === 'approved') {
+    const { data: aff } = await db
+      .from('affiliates')
+      .select('id, referral_code, status, display_name')
+      .eq('user_id', user.id)
+      .maybeSingle();
+    affiliate = aff;
+  }
+ 
+  return ok({ profile: app, affiliate }, request, env);
+}
+ 
+async function handlePartnerUpdateMe(
+  db: SupabaseClient, request: Request, env: Env
+): Promise<Response> {
+  const token = request.headers.get('Authorization')?.replace('Bearer ', '');
+  if (!token) return err('Unauthorized', 401, request, env);
+ 
+  const { data: { user } } = await db.auth.getUser(token);
+  if (!user) return err('Invalid token', 401, request, env);
+ 
+  const body = await request.json().catch(() => ({})) as any;
+ 
+  // Whitelist fields partners are allowed to update themselves
+  const allowed = [
+    'business_phone', 'alternate_phone', 'business_email',
+    'address', 'lga', 'state', 'social_media',
+    'owner_phone', 'contact_method', 'owner_location',
+    'payout_frequency', 'payout_method',
+    'bank_name', 'account_name', 'account_number',
+    'crypto_token', 'crypto_chain', 'wallet_address',
+  ];
+  const updates: Record<string, any> = {};
+  for (const k of allowed) {
+    if (body[k] !== undefined) updates[k] = body[k];
+  }
+  if (Object.keys(updates).length === 0) {
+    return err('No updatable fields provided', 400, request, env);
+  }
+  updates.updated_at = new Date().toISOString();
+ 
+  const { data, error: dbErr } = await db
+    .from('partner_applications')
+    .update(updates)
+    .eq('user_id', user.id)
+    .select()
+    .single();
+ 
+  if (dbErr) return err(dbErr.message, 500, request, env);
+  return ok(data, request, env);
+}
+ 
+async function handlePartnerMyStats(
+  db: SupabaseClient, request: Request, env: Env
+): Promise<Response> {
+  const token = request.headers.get('Authorization')?.replace('Bearer ', '');
+  if (!token) return err('Unauthorized', 401, request, env);
+ 
+  const { data: { user } } = await db.auth.getUser(token);
+  if (!user) return err('Invalid token', 401, request, env);
+ 
+  const { data, error: rpcErr } = await db.rpc('partner_dashboard_stats', {
+    p_user_id: user.id,
+  });
+  if (rpcErr) return err(rpcErr.message, 500, request, env);
+ 
   return ok(data, request, env);
 }
 
@@ -2952,3 +3340,161 @@ async function handleAdminDeleteDiscount(
   return ok({ deleted: true, id: discountId }, request, env);
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   PART 8 — PDF generator for receipts
+   Hand-rolled minimal PDF writer (no external deps). Suitable for
+   Cloudflare Workers. Output is a single-page A4 receipt.
+   ══════════════════════════════════════════════════════════════════ */
+ 
+async function buildReceiptPdf(order: any): Promise<Uint8Array> {
+  const items: any[] = order.order_items || [];
+  const fmt = (n: number) => `NGN ${Number(n || 0).toLocaleString('en-NG')}`;
+  // (PDF strings must not contain Unicode "₦" in a vanilla Helvetica encoding)
+  const date = (order.created_at ? new Date(order.created_at) : new Date())
+                .toISOString().slice(0, 10);
+ 
+  const W = 595.28, H = 841.89;   // A4 in points
+  const ML = 50, MR = 50;
+  const R = W - MR;
+ 
+  const p = new PdfWriter();
+ 
+  // Header band
+  p.rect(0, H - 120, W, 120, '#1a1432');
+  p.text('BuySub', ML, H - 62, 24, '#ffffff', 'bold');
+  p.text('buysub.ng', ML, H - 82, 11, '#b2a6d9');
+  p.text('RECEIPT', R, H - 55, 22, '#ffffff', 'bold', 'right');
+  p.text(`Order: ${order.order_ref || ''}`, R, H - 80, 10, '#b2a6d9', 'normal', 'right');
+  p.text(`Date:  ${date}`, R, H - 96, 10, '#b2a6d9', 'normal', 'right');
+ 
+  // Customer block
+  let y = H - 160;
+  p.text('BILLED TO', ML, y, 9, '#7a7a88', 'bold'); y -= 16;
+  p.text(order.customer_name || '—', ML, y, 12, '#1a1a22', 'bold'); y -= 14;
+  if (order.customer_email) { p.text(order.customer_email, ML, y, 10, '#555566'); y -= 12; }
+  if (order.customer_phone) { p.text(order.customer_phone, ML, y, 10, '#555566'); y -= 12; }
+ 
+  // Items table header
+  y -= 20;
+  p.rect(ML, y - 4, R - ML, 22, '#2a2a34');
+  p.text('ITEM',   ML + 10, y + 10, 9, '#ffffff', 'bold');
+  p.text('PERIOD', ML + 260, y + 10, 9, '#ffffff', 'bold');
+  p.text('QTY',    ML + 350, y + 10, 9, '#ffffff', 'bold');
+  p.text('AMOUNT', R - 10,   y + 10, 9, '#ffffff', 'bold', 'right');
+  y -= 22;
+ 
+  // Items
+  for (const it of items) {
+    y -= 18;
+    p.text(truncate(it.product_name || '', 38), ML + 10, y, 10.5, '#1a1a22');
+    p.text(it.billing_period || 'One-time',      ML + 260, y, 10, '#555566');
+    p.text(String(it.quantity || 1),              ML + 350, y, 10, '#555566');
+    p.text(fmt(it.total_price_ngn),               R - 10,   y, 10.5, '#1a1a22', 'normal', 'right');
+    p.hline(ML, y - 8, R, '#dddde3');
+  }
+ 
+  // Totals
+  y -= 30;
+  const labelX = R - 180, valueX = R - 10;
+  if (order.discount_ngn && order.discount_ngn > 0) {
+    p.text('Subtotal',  labelX, y, 10, '#6b6b7e'); p.text(fmt(order.subtotal_ngn || 0), valueX, y, 10, '#1a1a22', 'normal', 'right'); y -= 16;
+    p.text(`Discount${order.discount_code ? ' (' + order.discount_code + ')' : ''}`, labelX, y, 10, '#6b6b7e');
+    p.text('-' + fmt(order.discount_ngn), valueX, y, 10, '#16a34a', 'normal', 'right'); y -= 16;
+    p.hline(labelX, y + 4, R, '#d0d0d8'); y -= 6;
+  }
+  p.text('Total paid', labelX, y, 12, '#1a1a22', 'bold');
+  p.text(fmt(order.total_ngn), valueX, y, 14, '#7C5CFF', 'bold', 'right');
+ 
+  // Footer
+  p.rect(0, 0, W, 48, '#7C5CFF');
+  p.text('Thank you for shopping with BuySub', W / 2, 26, 10, '#ffffff', 'bold', 'center');
+  p.text('buysub.ng  ·  help@buysub.ng', W / 2, 14, 9, '#e8dfff', 'normal', 'center');
+ 
+  return p.build();
+}
+ 
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+ 
+function escHtml(s: string): string {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c] as string));
+}
+ 
+function bytesToBase64(bytes: Uint8Array): string {
+  let s = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any);
+  }
+  return btoa(s);
+}
+ 
+/* ── Minimal PDF writer (text, lines, filled rects). Single-page. ── */
+class PdfWriter {
+  private ops: string[] = [];
+ 
+  private esc(s: string): string {
+    return String(s).replace(/[\\()]/g, m => '\\' + m);
+  }
+  private hexToRgb(hex: string): [number, number, number] {
+    const h = hex.replace('#', '');
+    const n = parseInt(h.length === 3 ? h.split('').map(c => c + c).join('') : h, 16);
+    return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+  }
+ 
+  text(str: string, x: number, y: number, size: number, color = '#000000',
+       weight: 'normal' | 'bold' = 'normal', align: 'left' | 'right' | 'center' = 'left') {
+    // Approximate width for alignment (Helvetica avg char width at 500 units/em)
+    const approxW = (str.length * size * (weight === 'bold' ? 0.58 : 0.52));
+    let ax = x;
+    if (align === 'right')  ax = x - approxW;
+    if (align === 'center') ax = x - approxW / 2;
+ 
+    const [r, g, b] = this.hexToRgb(color);
+    const font = weight === 'bold' ? '/F2' : '/F1';
+    this.ops.push(`q ${r} ${g} ${b} rg BT ${font} ${size} Tf ${ax} ${y} Td (${this.esc(str)}) Tj ET Q`);
+  }
+ 
+  rect(x: number, y: number, w: number, h: number, fill: string) {
+    const [r, g, b] = this.hexToRgb(fill);
+    this.ops.push(`q ${r} ${g} ${b} rg ${x} ${y} ${w} ${h} re f Q`);
+  }
+ 
+  hline(x1: number, y: number, x2: number, color: string) {
+    const [r, g, b] = this.hexToRgb(color);
+    this.ops.push(`q ${r} ${g} ${b} RG 0.5 w ${x1} ${y} m ${x2} ${y} l S Q`);
+  }
+ 
+  build(): Uint8Array {
+    const content = this.ops.join('\n');
+    const objs: string[] = [];
+    objs.push('<< /Type /Catalog /Pages 2 0 R >>');
+    objs.push('<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+    objs.push(
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] ' +
+      '/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>'
+    );
+    objs.push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+    objs.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+    objs.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
+ 
+    let body = '%PDF-1.4\n%\xFF\xFF\xFF\xFF\n';
+    const offsets: number[] = [];
+    objs.forEach((o, i) => {
+      offsets.push(body.length);
+      body += `${i + 1} 0 obj\n${o}\nendobj\n`;
+    });
+    const xrefStart = body.length;
+    body += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+    for (const off of offsets) body += `${String(off).padStart(10, '0')} 00000 n \n`;
+    body += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+ 
+    const buf = new Uint8Array(body.length);
+    for (let i = 0; i < body.length; i++) buf[i] = body.charCodeAt(i) & 0xff;
+    return buf;
+  }
+}
