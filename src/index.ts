@@ -126,6 +126,10 @@ export default {
         const ref = path.split('/v2/admin/orders/')[1];
         return handleAdminGetOrder(db, ref, request, env);
       }
+      // ── Admin Manual Order Creation ──
+      if (path === '/v2/admin/orders' && method === 'POST') {
+        return handleAdminCreateOrder(db, request, env);
+      }
 
       // ── Customers ──
       if (path === '/v2/customers/search' && method === 'GET') {
@@ -432,6 +436,14 @@ export default {
       }
       if (path === '/v2/partners/me/stats' && method === 'GET') {
         return handlePartnerMyStats(db, request, env);
+      }
+
+      // ── Admin Settings ──
+      if (path === '/v2/admin/settings' && method === 'GET') {
+        return handleGetSettings(db, request, env)
+      }
+      if (path === '/v2/admin/settings' && method === 'PATCH') {
+        return handleUpdateSettings(db, request, env)
       }
 
       return err('Not found', 404, request, env);
@@ -1222,6 +1234,110 @@ async function handleAdminGetOrder(
   return ok(data, request, env);
 }
 
+// ============================================================
+// HANDLER: POST /v2/admin/orders  (manual order creation)
+// ============================================================
+async function handleAdminCreateOrder(
+  db: SupabaseClient, request: Request, env: Env
+): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await request.json().catch(() => null) as any;
+  if (!body) return err('Invalid request body', 400, request, env);
+
+  const { customer_name, customer_email, customer_phone, items, payment_method, notes, status, currency } = body;
+
+  if (!customer_email) return err('Customer email is required', 400, request, env);
+  if (!items?.length)   return err('At least one item is required', 400, request, env);
+
+  // Validate products and resolve prices
+  const productIds = items.map((i: any) => i.product_id).filter(Boolean);
+  const { data: products } = await db.from('products').select('*').in('id', productIds);
+  const productMap = new Map((products || []).map((p: any) => [p.id, p]));
+
+  let subtotalNGN = 0;
+  const resolvedItems: any[] = [];
+
+  for (const item of items) {
+    const product = productMap.get(item.product_id);
+    if (!product) return err(`Product not found: ${item.product_id}`, 400, request, env);
+
+    // Admin can override price — if override provided, use it; else resolve from DB
+    const priceField = getPriceField(item.billing_period || 'Quarterly');
+    const unitPrice = item.unit_price_ngn != null
+      ? Number(item.unit_price_ngn)
+      : (product[priceField] ?? 0);
+
+    const qty = Math.max(1, parseInt(item.quantity) || 1);
+    const lineTotal = unitPrice * qty;
+    subtotalNGN += lineTotal;
+
+    resolvedItems.push({
+      product_id: product.id,
+      product_name: product.name,
+      category: product.category,
+      billing_period: item.billing_period || 'Quarterly',
+      billing_type: product.billing_type || 'subscription',
+      duration_months: item.duration_months || 3,
+      unit_price_ngn: unitPrice,
+      quantity: qty,
+      total_price_ngn: lineTotal,
+    });
+  }
+
+  const discountNGN  = Number(body.discount_ngn)  || 0;
+  const taxNGN       = Number(body.tax_ngn)        || 0;
+  const totalNGN     = Math.max(0, subtotalNGN - discountNGN + taxNGN);
+  const orderStatus  = status || 'pending_manual';
+
+  // Find or create customer
+  const customerId = await findOrCreateCustomer(db, {
+    email: customer_email,
+    name: customer_name,
+    phone: customer_phone,
+    source: 'admin_manual',
+  });
+
+  // Generate order ref
+  const { data: refData } = await db.rpc('generate_order_ref');
+  const orderRef = refData as string;
+
+  // Insert order
+  const { data: order, error: oErr } = await db.from('orders').insert({
+    order_ref:      orderRef,
+    customer_id:    customerId,
+    customer_name:  customer_name  || null,
+    customer_email: customer_email,
+    customer_phone: customer_phone || null,
+    status:         orderStatus,
+    payment_method: payment_method || 'manual',
+    subtotal_ngn:   subtotalNGN,
+    discount_ngn:   discountNGN,
+    discount_code:  body.discount_code || null,
+    tax_ngn:        taxNGN,
+    total_ngn:      totalNGN,
+    currency:       currency || 'NGN',
+    fx_rate:        1,
+    display_total:  totalNGN,
+    notes:          notes || null,
+  }).select().single();
+
+  if (oErr || !order) return err('Failed to create order: ' + (oErr?.message || 'unknown'), 500, request, env);
+
+  // Insert order items
+  const orderItemRows = resolvedItems.map(i => ({ ...i, order_id: order.id }));
+  await db.from('order_items').insert(orderItemRows);
+
+  await logEvent(db, 'order', order.id, 'created_manual', auth.userId, {
+    order_ref: orderRef,
+    total_ngn: totalNGN,
+    item_count: resolvedItems.length,
+  });
+
+  return ok({ order_id: order.id, order_ref: orderRef, total_ngn: totalNGN, status: orderStatus }, request, env);
+}
+
 
 // ============================================================
 // HANDLER: GET /v2/customers/search
@@ -1502,10 +1618,49 @@ function buildOrderEmailHtml(
               </tr>
             </table>
  
+
+            ${(() => {
+              const links = items
+                .map((it: any) => {
+                  const p = productLinks[it.product_id];
+                  if (!p?.whatsapp_group_url) return null;
+            
+                  return {
+                    name: escHtml(p.name || it.product_name),
+                    url: escHtml(p.whatsapp_group_url),
+                  };
+                })
+                .filter((link): link is { name: string; url: string } => link !== null);
+            
+              if (!links.length) return '';
+            
+              return `
+                <div style="background:#0f0f14;border:1px solid #1c1c22;border-radius:12px;padding:16px 18px;">
+                  <div style="font-size:12px;color:#9b82ff;text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Next steps for your Order</div>
+                  <div style="margin-top:16px;">
+                    <div style="color:#a0a0b0;font-size:13px;line-height:1.6;">
+                      Please follow the link${links.length > 1 ? 's' : ''} below to join the BuySub community${links.length > 1 ? ' groups' : ''} on WhatsApp for complaint resolution, updates and other important information concerning your subscription.
+                    </div>
+              
+                    <div style="margin-top:10px;">
+                      ${links.map(l => `
+                        <div style="margin-bottom:6px;">
+                          <a href="${l.url}" target="_blank" rel="noopener"
+                            style="color:#7C5CFF;text-decoration:none;font-size:13px;">
+                            ${l.name}
+                          </a>
+                        </div>
+                      `).join('')}
+                    </div>
+                  </div> 
+                </div>
+              `;
+            })()}
+            
             <!-- Product-specific CTAs -->
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            /* <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
               ${productCards}
-            </table>
+            </table> */
  
           </td></tr>
  
@@ -3338,6 +3493,35 @@ async function handleAdminDeleteDiscount(
   await logEvent(db, 'discount', discountId, 'deleted', auth.userId, { code: existing[0].code });
 
   return ok({ deleted: true, id: discountId }, request, env);
+}
+
+async function handleGetSettings(db: any, request: Request, env: any) {
+  const { data, error } = await db.from('settings').select('*').single()
+
+  if (error) return err(error.message, 500, request, env)
+
+  return ok(data, request, env)
+}
+
+async function handleUpdateSettings(db: any, request: Request, env: any) {
+  const body: unknown = await request.json()
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return err('Invalid request body', 400, request, env)
+  }
+
+  const { data, error } = await db
+    .from('settings')
+    .update({
+      ...(body as Record<string, unknown>),
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', 1)
+    .select()
+    .single()
+
+  if (error) return err(error.message, 500, request, env)
+
+  return ok(data, request, env)
 }
 
 /* ══════════════════════════════════════════════════════════════════
