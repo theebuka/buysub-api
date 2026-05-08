@@ -157,6 +157,10 @@ export default {
       if (path === '/v2/admin/customers/search' && method === 'GET') {
         return handleAdminCustomerSearch(db, url, request, env);
       }
+      // GET /v2/admin/customers/:id/wallet  (for reading current balance in the panel)
+      if (path.match(/^\/v2\/admin\/customers\/[^/]+\/wallet$/) && method === 'GET') {
+        return handleAdminGetCustomerWallet(db, request, env)
+      }
 
       // ── Admin Products ──
       if (path === '/v2/admin/products' && method === 'GET') {
@@ -445,6 +449,34 @@ export default {
       if (path === '/v2/admin/settings' && method === 'PATCH') {
         return handleUpdateSettings(db, request, env)
       }
+
+      // Customer auth
+      if (path === '/v2/auth/signup'           && method === 'POST')  return handleCustomerSignup(db, request, env)
+    
+      // Authenticated customer endpoints
+      if (path === '/v2/me'                    && method === 'GET')   return handleGetMe(db, request, env)
+      if (path === '/v2/me'                    && method === 'PATCH') return handleUpdateMe(db, request, env)
+      if (path === '/v2/me/orders'             && method === 'GET')   return handleGetMyOrders(db, request, env)
+      if (path === '/v2/me/wallet'             && method === 'GET')   return handleGetMyWallet(db, request, env)
+      if (path === '/v2/me/wallet/transactions'&& method === 'GET')   return handleGetMyWalletTxns(db, request, env)
+      if (path === '/v2/me/messages'           && method === 'GET')   return handleGetMyMessages(db, request, env)
+      if (path.match(/^\/v2\/me\/messages\/[^/]+\/read$/) && method === 'PATCH') return handleMarkMessageRead(db, request, env)
+    
+      // Admin: send message to customer
+      if (path.match(/^\/v2\/admin\/customers\/[^/]+\/messages$/) && method === 'POST') return handleAdminSendMessage(db, request, env)
+    
+      // Admin: top up wallet
+      if (path.match(/^\/v2\/admin\/customers\/[^/]+\/wallet\/topup$/) && method === 'POST') return handleAdminWalletTopup(db, request, env)
+
+      // Admin: debit wallet (body: { customer_id, amount, reference })
+      if (path === '/v2/admin/wallet/debit' && method === 'POST') return handleAdminWalletDebit(db, request, env)
+
+      if (path.match(/^\/v2\/admin\/customers\/[^/]+\/wallet\/toggle$/) && method === 'POST') {
+        return handleAdminToggleWallet(db, request, env)
+      }
+    
+      // Admin: force reset password
+      if (path.match(/^\/v2\/admin\/customers\/[^/]+\/reset-password$/) && method === 'POST') return handleAdminForceReset(db, request, env)
 
       return err('Not found', 404, request, env);
     } catch (e: any) {
@@ -1619,48 +1651,8 @@ function buildOrderEmailHtml(
             </table>
  
 
-            ${(() => {
-              const links = items
-                .map((it: any) => {
-                  const p = productLinks[it.product_id];
-                  if (!p?.whatsapp_group_url) return null;
-            
-                  return {
-                    name: escHtml(p.name || it.product_name),
-                    url: escHtml(p.whatsapp_group_url),
-                  };
-                })
-                .filter((link): link is { name: string; url: string } => link !== null);
-            
-              if (!links.length) return '';
-            
-              return `
-                <div style="background:#0f0f14;border:1px solid #1c1c22;border-radius:12px;padding:16px 18px;">
-                  <div style="font-size:12px;color:#9b82ff;text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Next steps for your Order</div>
-                  <div style="margin-top:16px;">
-                    <div style="color:#a0a0b0;font-size:13px;line-height:1.6;">
-                      Please follow the link${links.length > 1 ? 's' : ''} below to join the BuySub community${links.length > 1 ? ' groups' : ''} on WhatsApp for complaint resolution, updates and other important information concerning your subscription.
-                    </div>
-              
-                    <div style="margin-top:10px;">
-                      ${links.map(l => `
-                        <div style="margin-bottom:6px;">
-                          <a href="${l.url}" target="_blank" rel="noopener"
-                            style="color:#7C5CFF;text-decoration:none;font-size:13px;">
-                            ${l.name}
-                          </a>
-                        </div>
-                      `).join('')}
-                    </div>
-                  </div> 
-                </div>
-              `;
-            })()}
-            
-            <!-- Product-specific CTAs -->
-            /* <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-              ${productCards}
-            </table> */
+            <!-- Product-specific CTAs (WhatsApp groups + social links) -->
+            ${productCards ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0">${productCards}</table>` : ''}
  
           </td></tr>
  
@@ -1911,6 +1903,16 @@ async function handleAdminCustomerSearch(
 
   if (dbErr) return err(dbErr.message, 500, request, env);
   return ok(data, request, env);
+}
+
+async function handleAdminGetCustomerWallet(db: SupabaseClient, request: Request, env: Env): Promise<Response> {
+  const auth = await requireAdmin(db, request, env)
+  if (!auth.ok) return auth.response
+  const customerId = new URL(request.url).pathname.split('/').at(-2)!
+  const { data: customer } = await db.from('customers').select('user_id').eq('id', customerId).limit(1)
+  if (!customer?.length || !customer[0].user_id) return ok({ balance_ngn: 0 }, request, env)
+  const { data: wallet } = await db.from('wallets').select('*').eq('user_id', customer[0].user_id).limit(1)
+  return ok(wallet?.[0] || { balance_ngn: 0 }, request, env)
 }
 
 async function handleAdminProducts(
@@ -3524,6 +3526,431 @@ async function handleUpdateSettings(db: any, request: Request, env: any) {
   return ok(data, request, env)
 }
 
+// ── helper: get user id from Bearer token ───────────────────────
+async function requireAuth(
+  db: any, request: Request, env: any
+): Promise<{ ok: true; userId: string; email: string } | { ok: false; response: Response }> {
+  const authHeader = request.headers.get('Authorization') || ''
+  const token = authHeader.replace('Bearer ', '').trim()
+  if (!token) return { ok: false, response: err('Unauthorized', 401, request, env) }
+ 
+  // Verify JWT with Supabase
+  const { data, error } = await db.auth.getUser(token)
+  if (error || !data?.user) return { ok: false, response: err('Unauthorized', 401, request, env) }
+  return { ok: true, userId: data.user.id, email: data.user.email || '' }
+}
+ 
+// ── POST /v2/auth/signup ─────────────────────────────────────────
+async function handleCustomerSignup(db: any, request: Request, env: any): Promise<Response> {
+  const body = await request.json().catch(() => null) as any
+  if (!body?.email) return err('Email is required', 400, request, env)
+ 
+  const { user_id, full_name, email, phone, gender } = body
+ 
+  // 1. Upsert profile row (id = Supabase auth UUID)
+  await db.from('profiles').upsert({
+    id:        user_id,
+    role:      'customer',
+    full_name: full_name || null,
+    email:     email,
+    phone:     phone || null,
+    gender:    gender || null,
+  }, { onConflict: 'id' })
+ 
+  // 2. Create or link customers row
+  const emailLower = email.toLowerCase()
+
+  const { data: existing } = await db.from('customers')
+    .select('id, user_id')
+    .ilike('email', emailLower)
+    .limit(1)
+
+  if (!existing?.length) {
+    await db.from('customers').insert({
+      user_id: user_id,
+      name:    full_name || email.split('@')[0],
+      email: emailLower,
+      phone:   phone || null,
+      source:  'customer_signup',
+      is_active: true,
+    })
+  } else {
+    // Link existing customer record to this auth user
+    await db
+    .from('customers')
+    .update({ user_id })
+    .ilike('email', emailLower)
+    .is('user_id', null)
+  }
+ 
+  // 3. Create wallet if not exists
+  const { data: walletExists } = await db.from('wallets').select('id').eq('user_id', user_id).limit(1)
+  if (!walletExists?.length) {
+    await db.from('wallets').insert({ user_id, balance_ngn: 0 })
+  }
+ 
+  return ok({ success: true }, request, env)
+}
+ 
+// ── GET /v2/me ───────────────────────────────────────────────────
+async function handleGetMe(db: any, request: Request, env: any): Promise<Response> {
+  const auth = await requireAuth(db, request, env)
+  if (!auth.ok) return auth.response
+ 
+  const { data: profile } = await db.from('profiles').select('*').eq('id', auth.userId).limit(1)
+  if (!profile?.length) return err('Profile not found', 404, request, env)
+ 
+  return ok({
+    ...profile[0],
+    email: profile[0].email || auth.email,
+  }, request, env)
+}
+ 
+// ── PATCH /v2/me ─────────────────────────────────────────────────
+async function handleUpdateMe(db: any, request: Request, env: any): Promise<Response> {
+  const auth = await requireAuth(db, request, env)
+  if (!auth.ok) return auth.response
+ 
+  const body = await request.json().catch(() => ({})) as any
+  const allowed: Record<string, any> = {}
+  if (body.full_name !== undefined) allowed.full_name = body.full_name
+  if (body.phone     !== undefined) allowed.phone     = body.phone
+  if (body.location  !== undefined) allowed.location  = body.location
+  if (body.avatar_url!== undefined) allowed.avatar_url= body.avatar_url
+ 
+  const { data, error } = await db.from('profiles').update(allowed).eq('id', auth.userId).select().single()
+  if (error) return err(error.message, 500, request, env)
+ 
+  // Also sync to customers table
+  if (allowed.full_name || allowed.phone) {
+    const patch: any = {}
+    if (allowed.full_name) patch.name  = allowed.full_name
+    if (allowed.phone)     patch.phone = allowed.phone
+    await db.from('customers').update(patch).eq('user_id', auth.userId)
+  }
+ 
+  return ok(data, request, env)
+}
+ 
+// ── GET /v2/me/orders ────────────────────────────────────────────
+async function handleGetMyOrders(db: any, request: Request, env: any): Promise<Response> {
+  const auth = await requireAuth(db, request, env)
+  if (!auth.ok) return auth.response
+ 
+  // Get customer's email from profile
+  const { data: profile } = await db.from('profiles').select('email').eq('id', auth.userId).limit(1)
+  const email = profile?.[0]?.email || auth.email
+ 
+  const { data: orders, error } = await db
+    .from('orders')
+    .select(`
+      id, order_ref, status, total_ngn, subtotal_ngn, discount_ngn,
+      payment_method, currency, created_at, updated_at,
+      order_items (
+        id, product_name, billing_period, quantity, unit_price_ngn, total_price_ngn
+      )
+    `)
+    .eq('customer_email', email)
+    .order('created_at', { ascending: false })
+    .limit(50)
+ 
+  if (error) return err(error.message, 500, request, env)
+  return ok(orders || [], request, env)
+}
+ 
+// ── GET /v2/me/wallet ────────────────────────────────────────────
+async function handleGetMyWallet(db: any, request: Request, env: any): Promise<Response> {
+  const auth = await requireAuth(db, request, env)
+  if (!auth.ok) return auth.response
+ 
+  const { data, error } = await db.from('wallets').select('*').eq('user_id', auth.userId).limit(1)
+  if (error) return err(error.message, 500, request, env)
+ 
+  // Auto-create wallet if missing
+  if (!data?.length) {
+    const { data: newWallet } = await db.from('wallets').insert({ user_id: auth.userId, balance_ngn: 0 }).select().single()
+    return ok(newWallet || { balance_ngn: 0 }, request, env)
+  }
+ 
+  return ok(data[0], request, env)
+}
+ 
+// ── GET /v2/me/wallet/transactions ───────────────────────────────
+async function handleGetMyWalletTxns(
+  db: SupabaseClient,
+  request: Request,
+  env: Env
+): Promise<Response> {
+
+  const auth = await requireAuth(db, request, env)
+  if (!auth.ok) return auth.response
+
+  // 1. Get wallet
+  const { data: wallet, error: wErr } = await db
+    .from('wallets')
+    .select('id')
+    .eq('user_id', auth.userId)
+    .single()
+
+  if (wErr || !wallet) {
+    return ok([], request, env)
+  }
+
+  // 2. Get transactions using wallet.id
+  const { data, error } = await db
+    .from('wallet_transactions')
+    .select('*')
+    .eq('wallet_id', wallet.id)
+    .order('created_at', { ascending: false })
+
+  if (error) return err(error.message, 500, request, env)
+
+  return ok(data || [], request, env)
+}
+ 
+// ── GET /v2/me/messages ──────────────────────────────────────────
+async function handleGetMyMessages(db: any, request: Request, env: any): Promise<Response> {
+  const auth = await requireAuth(db, request, env)
+  if (!auth.ok) return auth.response
+ 
+  // Find customer row
+  const { data: customer } = await db.from('customers').select('id').eq('user_id', auth.userId).limit(1)
+  if (!customer?.length) return ok([], request, env)
+ 
+  const { data, error } = await db
+    .from('customer_messages')
+    .select('*')
+    .eq('customer_id', customer[0].id)
+    .order('created_at', { ascending: false })
+    .limit(50)
+ 
+  if (error) return err(error.message, 500, request, env)
+  return ok(data || [], request, env)
+}
+ 
+// ── PATCH /v2/me/messages/:id/read ──────────────────────────────
+async function handleMarkMessageRead(db: any, request: Request, env: any): Promise<Response> {
+  const auth = await requireAuth(db, request, env)
+  if (!auth.ok) return auth.response
+ 
+  const url  = new URL(request.url)
+  const parts = url.pathname.split('/')
+  const msgId = parts[parts.indexOf('messages') + 1]
+ 
+  // Verify ownership via customer_id
+  const { data: customer } = await db.from('customers').select('id').eq('user_id', auth.userId).limit(1)
+  if (!customer?.length) return err('Not found', 404, request, env)
+ 
+  await db.from('customer_messages')
+    .update({ is_read: true })
+    .eq('id', msgId)
+    .eq('customer_id', customer[0].id)
+ 
+  return ok({ updated: true }, request, env)
+}
+ 
+// ── POST /v2/admin/customers/:id/messages ────────────────────────
+async function handleAdminSendMessage(db: any, request: Request, env: any): Promise<Response> {
+  const auth = await requireAdmin(db, request, env)
+  if (!auth.ok) return auth.response
+ 
+  const url        = new URL(request.url)
+  const customerId = url.pathname.split('/').at(-2)!
+  const body       = await request.json().catch(() => null) as any
+ 
+  if (!body?.subject) return err('subject is required', 400, request, env)
+  if (!body?.body)    return err('body is required',    400, request, env)
+ 
+  const { data, error } = await db.from('customer_messages').insert({
+    customer_id:    customerId,
+    subject:        body.subject,
+    product_name:   body.product_name   || null,
+    product_domain: body.product_domain || null,
+    body:           body.body,
+    expires_at:     body.expires_at     || null,
+    created_by:     auth.userId,
+  }).select().single()
+ 
+  if (error) return err(error.message, 500, request, env)
+  return ok(data, request, env)
+}
+ 
+// ── POST /v2/admin/customers/:id/wallet/topup ────────────────────
+async function handleAdminWalletTopup(db: any, request: Request, env: any): Promise<Response> {
+  const auth = await requireAdmin(db, request, env)
+  if (!auth.ok) return auth.response
+ 
+  const url        = new URL(request.url)
+  const parts      = url.pathname.split('/')
+  const customerId = parts[parts.indexOf('customers') + 1]
+  const body       = await request.json().catch(() => null) as any
+ 
+  if (!body?.amount_ngn || body.amount_ngn <= 0) return err('amount_ngn must be positive', 400, request, env)
+ 
+  // Get customer's user_id
+  const { data: customer } = await db.from('customers').select('user_id').eq('id', customerId).limit(1)
+  if (!customer?.length || !customer[0].user_id) return err('Customer not found or not linked to auth account', 404, request, env)
+ 
+  const userId = customer[0].user_id
+
+  // Get or create wallet
+  let { data: wallet } = await db.from('wallets').select('*').eq('user_id', userId).limit(1)
+  if (!wallet?.length) {
+    const { data: newWallet } = await db.from('wallets').insert({ user_id: userId, balance_ngn: 0 }).select().single()
+    wallet = [newWallet]
+  }
+ 
+  const newBalance = Number(wallet[0].balance_ngn) + Number(body.amount_ngn)
+
+  if (!wallet[0].is_active) {
+    return err('Wallet disabled', 403, request, env)
+  }
+
+  const sourceMap: Record<string, 'admin' | 'refund'> = {
+    admin_topup: 'admin',
+    refund: 'refund',
+    promotion: 'admin',
+    compensation: 'admin',
+  }
+  
+  const { error: rpcError } = await db.rpc('credit_wallet', {
+    p_wallet_id: wallet[0].id,
+    p_amount: Number(body.amount_ngn),
+    p_reference: body.reference || body.source || 'admin topup',
+    p_source: sourceMap[body.source] || 'admin',
+  })
+  
+  if (rpcError) return err(rpcError.message, 500, request, env)
+ 
+  await logEvent(db, 'wallet', wallet[0].id, 'topup', auth.userId, {
+    amount_ngn: body.amount_ngn,
+    customer_id: customerId,
+    new_balance: newBalance,
+  })
+ 
+  // fetch fresh balance
+  const { data: updatedWallet } = await db
+  .from('wallets')
+  .select('balance_ngn')
+  .eq('id', wallet[0].id)
+  .single()
+
+  return ok({ balance_ngn: updatedWallet?.balance_ngn }, request, env)
+}
+
+async function handleAdminWalletDebit(db: any, request: Request, env: any) {
+  const auth = await requireAdmin(db, request, env)
+  if (!auth.ok) return auth.response
+
+  const { customer_id, amount, reference } = await request.json().catch(() => null) as any
+
+  if (!customer_id || !amount || amount <= 0) {
+    return err('Invalid payload', 400, request, env)
+  }
+
+  const { data: customer } = await db
+    .from('customers')
+    .select('user_id')
+    .eq('id', customer_id)
+    .single()
+
+  if (!customer?.user_id) return err('Customer not found', 404, request, env)
+
+  const { data: wallet } = await db
+    .from('wallets')
+    .select('id')
+    .eq('user_id', customer.user_id)
+    .single()
+
+  if (!wallet) return err('Wallet not found', 404, request, env)
+
+  const { error } = await db.rpc('debit_wallet', {
+    p_wallet_id: wallet.id,
+    p_amount: Number(amount),
+    p_reference: reference || 'admin debit',
+  })
+
+  if (error) return err(error.message, 500, request, env)
+
+  return ok({ success: true }, request, env)
+}
+
+
+async function handleAdminToggleWallet(db: any, request: Request, env: any) {
+  const auth = await requireAdmin(db, request, env)
+  if (!auth.ok) return auth.response
+
+  const customerId = request.url.split('/')[4]
+
+  // 1. get user_id from customer
+  const { data: customer } = await db
+  .from('customers')
+  .select('user_id')
+  .eq('id', customerId)
+  .single()
+
+  if (!customer?.user_id) return err('Customer not found', 404, request, env)
+
+  // 2. get wallet using user_id
+  const { data: wallet } = await db
+  .from('wallets')
+  .select('id, is_active')
+  .eq('user_id', customer.user_id)
+  .single()
+
+  if (!wallet) return err('Wallet not found', 404, request, env)
+
+  const { error } = await db
+    .from('wallets')
+    .update({ is_active: !wallet.is_active })
+    .eq('id', wallet.id)
+
+  if (error) return err(error.message, 500, request, env)
+
+  return ok({ is_active: !wallet.is_active }, request, env)
+}
+ 
+// ── POST /v2/admin/customers/:id/reset-password ──────────────────
+async function handleAdminForceReset(db: any, request: Request, env: any): Promise<Response> {
+  const auth = await requireAdmin(db, request, env)
+  if (!auth.ok) return auth.response
+ 
+  const url        = new URL(request.url)
+  const customerId = url.pathname.split('/').at(-2)!
+ 
+  // Get customer auth user_id
+  const { data: customer } = await db.from('customers').select('user_id, email').eq('id', customerId).limit(1)
+  if (!customer?.length || !customer[0].user_id) return err('Customer not linked to auth account', 404, request, env)
+ 
+  // Use Supabase Admin API (requires service_role key — call from Worker env)
+  const serviceRoleKey = (env as any).SUPABASE_SERVICE_ROLE_KEY || ''
+  if (!serviceRoleKey) return err('Service role key not configured', 500, request, env)
+ 
+  // Generate random temporary password
+  const tempPassword = Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6).toUpperCase() + '!7'
+ 
+  const res = await fetch(`${(env as any).SUPABASE_URL}/auth/v1/admin/users/${customer[0].user_id}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': serviceRoleKey,
+      'Authorization': `Bearer ${serviceRoleKey}`,
+    },
+    body: JSON.stringify({ password: tempPassword }),
+  })
+ 
+  if (!res.ok) {
+    const detail = await res.text()
+    return err('Failed to reset password: ' + detail, 500, request, env)
+  }
+ 
+  await logEvent(db, 'customer', customer[0].user_id, 'force_password_reset', auth.userId, {
+    customer_id: customerId,
+  })
+ 
+  return ok({ temp_password: tempPassword, email: customer[0].email }, request, env)
+}
+
 /* ══════════════════════════════════════════════════════════════════
    PART 8 — PDF generator for receipts
    Hand-rolled minimal PDF writer (no external deps). Suitable for
@@ -3532,68 +3959,145 @@ async function handleUpdateSettings(db: any, request: Request, env: any) {
  
 async function buildReceiptPdf(order: any): Promise<Uint8Array> {
   const items: any[] = order.order_items || [];
-  const fmt = (n: number) => `NGN ${Number(n || 0).toLocaleString('en-NG')}`;
-  // (PDF strings must not contain Unicode "₦" in a vanilla Helvetica encoding)
-  const date = (order.created_at ? new Date(order.created_at) : new Date())
-                .toISOString().slice(0, 10);
- 
-  const W = 595.28, H = 841.89;   // A4 in points
-  const ML = 50, MR = 50;
-  const R = W - MR;
- 
+  // PDF strings must not contain Unicode "₦" in a vanilla Helvetica encoding
+  const fmtNGN = (n: number) => `NGN ${Number(n || 0).toLocaleString('en-NG', { minimumFractionDigits: 2 })}`;
+  const fmtDate = (iso: string) => {
+    try { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); }
+    catch { return iso || ''; }
+  };
+
+  // A4 in PDF points (1pt = 1/72 inch). PdfWriter uses bottom-left origin.
+  const W = 595.28, H = 841.89;
+  const ML = 36, MR = 36, R = W - MR;
+
   const p = new PdfWriter();
- 
-  // Header band
-  p.rect(0, H - 120, W, 120, '#1a1432');
-  p.text('BuySub', ML, H - 62, 24, '#ffffff', 'bold');
-  p.text('buysub.ng', ML, H - 82, 11, '#b2a6d9');
-  p.text('RECEIPT', R, H - 55, 22, '#ffffff', 'bold', 'right');
-  p.text(`Order: ${order.order_ref || ''}`, R, H - 80, 10, '#b2a6d9', 'normal', 'right');
-  p.text(`Date:  ${date}`, R, H - 96, 10, '#b2a6d9', 'normal', 'right');
- 
-  // Customer block
-  let y = H - 160;
-  p.text('BILLED TO', ML, y, 9, '#7a7a88', 'bold'); y -= 16;
-  p.text(order.customer_name || '—', ML, y, 12, '#1a1a22', 'bold'); y -= 14;
-  if (order.customer_email) { p.text(order.customer_email, ML, y, 10, '#555566'); y -= 12; }
-  if (order.customer_phone) { p.text(order.customer_phone, ML, y, 10, '#555566'); y -= 12; }
- 
-  // Items table header
-  y -= 20;
-  p.rect(ML, y - 4, R - ML, 22, '#2a2a34');
-  p.text('ITEM',   ML + 10, y + 10, 9, '#ffffff', 'bold');
-  p.text('PERIOD', ML + 260, y + 10, 9, '#ffffff', 'bold');
-  p.text('QTY',    ML + 350, y + 10, 9, '#ffffff', 'bold');
-  p.text('AMOUNT', R - 10,   y + 10, 9, '#ffffff', 'bold', 'right');
-  y -= 22;
- 
-  // Items
+
+  // ── Logo placeholder (purple square + "B") ──────────────────────────
+  // PdfWriter has no roundedRect; use a plain filled rect as fallback
+  const LOGO_X = ML, LOGO_Y = H - 52, LOGO_SZ = 32;
+  p.rect(LOGO_X, LOGO_Y, LOGO_SZ, LOGO_SZ, '#7C5CFF');
+  p.text('B', LOGO_X + 9, LOGO_Y + 11, 18, '#ffffff', 'bold');
+
+  // Company name + URL beneath logo
+  p.text('BuySub',    ML, LOGO_Y - 10, 9.5, '#16161c', 'bold');
+  p.text('buysub.ng', ML, LOGO_Y - 20, 8,   '#787888');
+
+  // "RECEIPT" label + order ref (top-right)
+  p.text('RECEIPT',              R, H - 22, 22, '#16161c', 'bold', 'right');
+  p.text(`Order: ${order.order_ref || ''}`, R, H - 38, 8.5, '#787888', 'normal', 'right');
+
+  // Divider under header area
+  const divY = H - 62;
+  p.hline(ML, divY, R, '#b4b4c0');
+
+  // ── Two-column customer + meta block ────────────────────────────────
+  const metaLX = ML + 258; // right-hand column starts here
+  let custY = divY - 14;
+
+  p.text('Addressed To:', ML, custY, 8, '#787888'); custY -= 11;
+  p.text(order.customer_name || '—', ML, custY, 10, '#14141c', 'bold'); custY -= 10;
+  if (order.customer_phone) { p.text(order.customer_phone, ML, custY, 8.5, '#555566'); custY -= 9; }
+  if (order.customer_email) { p.text(order.customer_email, ML, custY, 8.5, '#555566'); custY -= 9; }
+
+  // Meta rows (right column aligned to same top)
+  const metaTopY = divY - 14;
+  const metaRow = (label: string, val: string, ry: number) => {
+    p.text(label, metaLX, ry, 8, '#787888');
+    p.text(val || '—', R, ry, 8.5, '#16161c', 'normal', 'right');
+  };
+  const orderDate = fmtDate(order.created_at || new Date().toISOString());
+  metaRow('Payment Date:', orderDate,                  metaTopY);
+  metaRow('Payment:',      order.payment_method || '—', metaTopY - 11);
+  metaRow('Generated:',    fmtDate(new Date().toISOString()), metaTopY - 22);
+
+  // Items table starts below the lower of the two columns
+  let y = Math.min(custY, metaTopY - 33) - 10;
+
+  // ── Table header ────────────────────────────────────────────────────
+  const TBL_H = 17;
+  p.rect(ML, y - 3, R - ML, TBL_H, '#2a2a34');
+  const tx_name   = ML + 6;
+  const tx_period = ML + 204;
+  const tx_units  = ML + 282;
+  const tx_rate   = ML + 318;
+  const tx_amount = R - 6;
+  p.text('ITEM',   tx_name,   y + 9,  8, '#ffffff', 'bold');
+  p.text('PERIOD', tx_period, y + 9,  8, '#ffffff', 'bold');
+  p.text('UNITS',  tx_units,  y + 9,  8, '#ffffff', 'bold');
+  p.text('RATE',   tx_rate,   y + 9,  8, '#ffffff', 'bold');
+  p.text('AMOUNT', tx_amount, y + 9,  8, '#ffffff', 'bold', 'right');
+  y -= TBL_H;
+
+  // ── Item rows ────────────────────────────────────────────────────────
   for (const it of items) {
-    y -= 18;
-    p.text(truncate(it.product_name || '', 38), ML + 10, y, 10.5, '#1a1a22');
-    p.text(it.billing_period || 'One-time',      ML + 260, y, 10, '#555566');
-    p.text(String(it.quantity || 1),              ML + 350, y, 10, '#555566');
-    p.text(fmt(it.total_price_ngn),               R - 10,   y, 10.5, '#1a1a22', 'normal', 'right');
-    p.hline(ML, y - 8, R, '#dddde3');
+    const unitNGN = it.unit_price_ngn ?? (it.total_price_ngn / (it.quantity || 1));
+    const lineNGN = it.total_price_ngn ?? (unitNGN * (it.quantity || 1));
+    const nameLine = truncate(it.product_name || '', 32);
+
+    y -= 4; // top padding
+    p.text(nameLine, tx_name, y, 9.5, '#14141c');
+
+    // category sub-line (if present)
+    const hasCat = !!it.category;
+    if (hasCat) {
+      p.text(it.category, tx_name, y - 8, 7.5, '#828294');
+    }
+
+    p.text(it.billing_period || 'One-time', tx_period, y, 9, '#555566');
+    p.text(String(it.quantity || 1),        tx_units,  y, 9, '#555566');
+    p.text(fmtNGN(unitNGN),                 tx_rate,   y, 9, '#555566');
+    p.text(fmtNGN(lineNGN),                 tx_amount, y, 9.5, '#14141c', 'normal', 'right');
+
+    const rowH = hasCat ? 22 : 14;
+    p.hline(ML, y - (hasCat ? 11 : 4), R, '#d7d7de');
+    y -= rowH;
   }
- 
-  // Totals
-  y -= 30;
-  const labelX = R - 180, valueX = R - 10;
-  if (order.discount_ngn && order.discount_ngn > 0) {
-    p.text('Subtotal',  labelX, y, 10, '#6b6b7e'); p.text(fmt(order.subtotal_ngn || 0), valueX, y, 10, '#1a1a22', 'normal', 'right'); y -= 16;
-    p.text(`Discount${order.discount_code ? ' (' + order.discount_code + ')' : ''}`, labelX, y, 10, '#6b6b7e');
-    p.text('-' + fmt(order.discount_ngn), valueX, y, 10, '#16a34a', 'normal', 'right'); y -= 16;
-    p.hline(labelX, y + 4, R, '#d0d0d8'); y -= 6;
+
+  // ── Totals ────────────────────────────────────────────────────────────
+  y -= 8;
+  const totLX = R - 168, totRX = R - 6;
+
+  const totRow = (label: string, value: string, bold = false, green = false) => {
+    const sz = bold ? 10.5 : 9;
+    p.text(label, totLX, y, sz, green ? '#16a34a' : '#6b6b7e', bold ? 'bold' : 'normal');
+    p.text(value, totRX, y, sz, green ? '#16a34a' : (bold ? '#14141c' : '#444454'), bold ? 'bold' : 'normal', 'right');
+    y -= bold ? 8 : 7;
+  };
+
+  const hasDiscount = order.discount_ngn && order.discount_ngn > 0;
+  if (hasDiscount) {
+    totRow('Subtotal', fmtNGN(order.subtotal_ngn || 0));
+    totRow(
+      `Discount${order.discount_code ? ' (' + order.discount_code + ')' : ''}`,
+      '-' + fmtNGN(order.discount_ngn),
+      false, true,
+    );
+    p.hline(totLX, y + 3, R, '#bebece');
+    y -= 6;
   }
-  p.text('Total paid', labelX, y, 12, '#1a1a22', 'bold');
-  p.text(fmt(order.total_ngn), valueX, y, 14, '#7C5CFF', 'bold', 'right');
- 
-  // Footer
-  p.rect(0, 0, W, 48, '#7C5CFF');
-  p.text('Thank you for shopping with BuySub', W / 2, 26, 10, '#ffffff', 'bold', 'center');
-  p.text('buysub.ng  ·  help@buysub.ng', W / 2, 14, 9, '#e8dfff', 'normal', 'center');
- 
+  totRow('Total', fmtNGN(order.total_ngn), true);
+
+  // ── Notes ────────────────────────────────────────────────────────────
+  y -= 14;
+  const note = 'Thank you for your purchase with BuySub! For support, email help@buysub.ng or message us on WhatsApp.';
+  p.text('Notes:', ML, y, 8, '#787888'); y -= 8;
+  // Wrap note manually at ~90 chars per line
+  const noteWords = note.split(' ');
+  let line = '';
+  for (const word of noteWords) {
+    if ((line + word).length > 88) {
+      p.text(line.trim(), ML, y, 8.5, '#464658'); y -= 8;
+      line = '';
+    }
+    line += word + ' ';
+  }
+  if (line.trim()) { p.text(line.trim(), ML, y, 8.5, '#464658'); y -= 8; }
+
+  // ── Footer ───────────────────────────────────────────────────────────
+  const FOOTER_H = 36;
+  p.rect(0, 0, W, FOOTER_H, '#7C5CFF');
+  p.text('buysub.ng  ·  help@buysub.ng', W / 2, FOOTER_H / 2 + 2, 9, '#ffffff', 'bold', 'center');
+
   return p.build();
 }
  
