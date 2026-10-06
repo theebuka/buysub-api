@@ -2628,7 +2628,7 @@ async function handlePartnerMe(
   if (app.status === 'approved') {
     const { data: aff } = await db
       .from('affiliates')
-      .select('id, referral_code, status, store_name, business_name')
+      .select('id, referral_code, status, store_name, business_name, commission_rate')
       .eq('user_id', user.id)
       .maybeSingle();
     // display_name is what the partner dashboard reads; there is no such column.
@@ -2691,8 +2691,36 @@ async function handlePartnerMyStats(
     p_user_id: user.id,
   });
   if (rpcErr) return err(rpcErr.message, 500, request, env);
- 
-  return ok(data, request, env);
+
+  // Extras for the /partner portal, computed here so the RPC (and anything
+  // else reading it) is unchanged: commission owed but not yet paid, the
+  // commission rate, and a 30-day daily series of clicks and conversions.
+  const stats: any = { ...(data || {}) };
+  const affiliateId = stats.affiliate_id;
+  if (affiliateId) {
+    const since = new Date(Date.now() - 29 * 86_400_000);
+    since.setUTCHours(0, 0, 0, 0);
+    const [aff, approved, clicks, convs] = await Promise.all([
+      db.from('affiliates').select('commission_rate').eq('id', affiliateId).maybeSingle(),
+      db.from('affiliate_commissions').select('amount_ngn').eq('affiliate_id', affiliateId).eq('status', 'approved'),
+      db.from('affiliate_clicks').select('created_at').eq('affiliate_id', affiliateId).gte('created_at', since.toISOString()).limit(10000),
+      db.from('affiliate_commissions').select('created_at, amount_ngn').eq('affiliate_id', affiliateId).gte('created_at', since.toISOString()).limit(10000),
+    ]);
+    const days: Record<string, { date: string; clicks: number; conversions: number; earned_ngn: number }> = {};
+    for (let i = 0; i < 30; i++) {
+      const d = new Date(since.getTime() + i * 86_400_000).toISOString().slice(0, 10);
+      days[d] = { date: d, clicks: 0, conversions: 0, earned_ngn: 0 };
+    }
+    for (const c of clicks.data || []) { const d = String(c.created_at).slice(0, 10); if (days[d]) days[d].clicks++; }
+    for (const c of convs.data || []) {
+      const d = String(c.created_at).slice(0, 10)
+      if (days[d]) { days[d].conversions++; days[d].earned_ngn += Number(c.amount_ngn) || 0 }
+    }
+    stats.commission_rate = aff.data?.commission_rate ?? null;
+    stats.approved_ngn = (approved.data || []).reduce((s: number, r: any) => s + (Number(r.amount_ngn) || 0), 0);
+    stats.daily = Object.values(days);
+  }
+  return ok(stats, request, env);
 }
 
 async function handleAdminWallets(
