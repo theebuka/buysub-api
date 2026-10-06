@@ -16,13 +16,8 @@ export const TAB_ORDER = [
   'gaming', 'services', 'coins', 'social media',
 ] as const;
 
-// ── FX (static fallback) ──
-export const STATIC_FX: Record<string, number> = {
-  NGN: 1,
-  USD: 1 / 1300,
-  GBP: 1 / 1860,
-  CAD: 1 / 920,
-};
+// FX lives only in buysub-web/lib/constants.ts. The API charges in NGN and
+// stores the display rate the storefront sent (orders.fx_rate).
 
 // ── Formatting ──
 export const formatNGN = (value: number): string => {
