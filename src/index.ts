@@ -460,6 +460,7 @@ export default {
       if (path === '/v2/me'                    && method === 'GET')   return handleGetMe(db, request, env)
       if (path === '/v2/me'                    && method === 'PATCH') return handleUpdateMe(db, request, env)
       if (path === '/v2/me/orders'             && method === 'GET')   return handleGetMyOrders(db, request, env)
+      if (path.match(/^\/v2\/me\/orders\/[^/]+$/) && method === 'GET') return handleGetMyOrder(db, decodeURIComponent(path.split('/').pop() || ''), request, env)
       if (path === '/v2/me/wallet'             && method === 'GET')   return handleGetMyWallet(db, request, env)
       if (path === '/v2/me/wallet/transactions'&& method === 'GET')   return handleGetMyWalletTxns(db, request, env)
       if (path === '/v2/me/messages'           && method === 'GET')   return handleGetMyMessages(db, request, env)
@@ -3989,32 +3990,77 @@ async function handleUpdateMe(db: any, request: Request, env: any): Promise<Resp
 }
  
 // ── GET /v2/me/orders ────────────────────────────────────────────
+// `data` stays a plain array (app/dashboard reads it that way); paging is in
+// meta.pagination. Optional ?status= takes a raw status or one of the account
+// buckets (processing | completed | cancelled), ?q= matches the order ref.
+const MY_ORDER_COLUMNS = `
+  id, order_ref, status, total_ngn, subtotal_ngn, discount_ngn, wallet_ngn,
+  discount_code, payment_method, currency, fx_rate, display_total,
+  created_at, updated_at, paid_at,
+  order_items (
+    id, product_id, product_name, category, billing_period, billing_type,
+    duration_months, quantity, unit_price_ngn, total_price_ngn,
+    products ( slug, domain, image_url )
+  )
+`
+const ORDER_BUCKETS: Record<string, string[]> = {
+  processing: ['pending', 'pending_manual', 'rejected_pending'],
+  completed: ['paid'],
+  cancelled: ['failed', 'refunded', 'cancelled'],
+}
+
+async function myEmail(db: any, auth: { userId: string; email?: string }) {
+  const { data: profile } = await db.from('profiles').select('email').eq('id', auth.userId).limit(1)
+  return String(profile?.[0]?.email || auth.email || '').toLowerCase()
+}
+
 async function handleGetMyOrders(db: any, request: Request, env: any): Promise<Response> {
   const auth = await requireAuth(db, request, env)
   if (!auth.ok) return auth.response
- 
-  // Get customer's email from profile
-  const { data: profile } = await db.from('profiles').select('email').eq('id', auth.userId).limit(1)
-  const email = profile?.[0]?.email || auth.email
- 
-  const { data: orders, error } = await db
+
+  const url = new URL(request.url)
+  const page = Math.max(1, parseInt(url.searchParams.get('page') || '1') || 1)
+  const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get('limit') || '50') || 50))
+  const status = (url.searchParams.get('status') || '').trim()
+  const q = (url.searchParams.get('q') || '').trim()
+  const email = await myEmail(db, auth)
+
+  let query = db
     .from('orders')
-    .select(`
-      id, order_ref, status, total_ngn, subtotal_ngn, discount_ngn,
-      payment_method, currency, created_at, updated_at,
-      order_items (
-        id, product_name, billing_period, quantity, unit_price_ngn, total_price_ngn
-      )
-    `)
+    .select(MY_ORDER_COLUMNS, { count: 'exact' })
     // Case-insensitive: checkout emails were stored as typed before being lower-cased.
-    .ilike('customer_email', escapeLike(String(email).toLowerCase()))
+    .ilike('customer_email', escapeLike(email))
     .order('created_at', { ascending: false })
-    .limit(50)
- 
+    .range((page - 1) * limit, page * limit - 1)
+
+  if (status) query = ORDER_BUCKETS[status] ? query.in('status', ORDER_BUCKETS[status]) : query.eq('status', status)
+  if (q) query = query.ilike('order_ref', `%${escapeLike(q)}%`)
+
+  const { data: orders, error, count } = await query
   if (error) return err(error.message, 500, request, env)
-  return ok(orders || [], request, env)
+  return ok(orders || [], request, env, {
+    pagination: { page, limit, total: count ?? 0, pages: Math.ceil((count || 0) / limit) },
+  })
 }
- 
+
+// ── GET /v2/me/orders/:ref ───────────────────────────────────────
+// One of the caller's own orders. Matched by email like the list, so a ref
+// belonging to someone else is a 404, not a 403 (refs are guessable).
+async function handleGetMyOrder(db: any, ref: string, request: Request, env: any): Promise<Response> {
+  const auth = await requireAuth(db, request, env)
+  if (!auth.ok) return auth.response
+  const email = await myEmail(db, auth)
+  const { data, error } = await db
+    .from('orders')
+    .select(MY_ORDER_COLUMNS)
+    .ilike('customer_email', escapeLike(email))
+    .eq('order_ref', ref)
+    .limit(1)
+  if (error) return err(error.message, 500, request, env)
+  if (!data?.length) return err('Order not found', 404, request, env)
+  return ok(data[0], request, env)
+}
+
 // ── GET /v2/me/wallet ────────────────────────────────────────────
 async function handleGetMyWallet(db: any, request: Request, env: any): Promise<Response> {
   const auth = await requireAuth(db, request, env)
