@@ -493,6 +493,20 @@ export default {
 // ============================================================
 // HANDLER: GET /v2/products
 // ============================================================
+
+// What anonymous visitors may see of a product. Not '*': whatsapp_group_url
+// (the paid customers' group) and social_links are post-purchase details,
+// sent only in order confirmations. Matches the anon column GRANT in
+// supabase-migrations/07_product_merchandising.sql. A new public product
+// column goes in both places.
+const PUBLIC_PRODUCT_COLUMNS = [
+  'id', 'name', 'slug', 'category', 'description', 'short_description', 'category_tagline',
+  'price_1m', 'price_3m', 'price_6m', 'price_1y', 'billing_type', 'billing_period', 'tags',
+  'domain', 'stock_status', 'status', 'image_url', 'sort_order', 'featured', 'updated_at',
+  'badge', 'delivery_time', 'delivery_method', 'region', 'features', 'how_it_works', 'faqs',
+  'seo_title', 'seo_description',
+].join(',');
+
 async function handleGetProducts(
   db: SupabaseClient, url: URL, request: Request, env: Env,
 ): Promise<Response> {
@@ -502,7 +516,7 @@ async function handleGetProducts(
   const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0') || 0);
 
   let query = db.from('products')
-    .select('*', { count: 'exact' })
+    .select(PUBLIC_PRODUCT_COLUMNS, { count: 'exact' })
     .is('deleted_at', null)
     .eq('status', 'active')
     .order('sort_order', { ascending: true })
@@ -530,7 +544,7 @@ async function handleGetProductBySlug(
   db: SupabaseClient, slug: string, request: Request, env: Env,
 ): Promise<Response> {
   const { data, error } = await db.from('products')
-    .select('*')
+    .select(PUBLIC_PRODUCT_COLUMNS)
     .eq('slug', slug)
     .eq('status', 'active')
     .is('deleted_at', null)
@@ -701,7 +715,9 @@ async function prepareOrder(
     const period = PERIOD_INFO[raw.billing_period];
     if (!period) return fail(`Unknown billing period for ${product.name}`);
     const dbPrice = product[period.field];
-    if (dbPrice == null) return fail(`${product.name} is not available for ${raw.billing_period}`);
+    // Null or zero both mean "not sold for this period" (buysub-web/lib/pricing.ts
+    // hides such periods). A 0 used to pass and could be ordered for free.
+    if (!(Number(dbPrice) > 0)) return fail(`${product.name} is not available for ${raw.billing_period}`);
     if (Math.abs(Number(raw.unit_price_ngn) - dbPrice) > 1) {
       return fail(`Price for ${product.name} has changed. Refresh the page to see the current price.`);
     }
@@ -894,14 +910,11 @@ async function handleWhatsAppOrder(
     const { orderRef, totalNGN } = created;
     const { items, subtotalNGN: serverSubtotal, discountNGN, discountCode, currency, fxRate } = prepared.order;
 
-    // Build WhatsApp message for admin
-    // Fetch product WA/social links for items
-    const waProductIds = items.map(i => i.product_id);
-    const { data: waProducts } = await db
-      .from('products')
-      .select('id, whatsapp_group_url, social_links')
-      .in('id', waProductIds);
-    const waProductMap = new Map((waProducts || []).map((p: any) => [p.id, p]));
+    // The message is returned to the shopper's browser and pre-filled in THEIR
+    // WhatsApp, before any payment. It used to append each product's
+    // whatsapp_group_url, which handed the paid customers' group link to anyone
+    // who placed an unpaid order. Group links go out only after payment, in the
+    // confirmation email (sendConfirmationEmail).
 
     const fmtAmt = (v: number) => {
       if (currency === 'NGN') return `₦${Math.ceil(v).toLocaleString()}`;
@@ -924,10 +937,6 @@ async function handleWhatsAppOrder(
     for (const item of items) {
       const lineTotal = item.unit_price_ngn * item.quantity;
       lines.push(`• ${item.product_name} ×${item.quantity} (${item.billing_period}) — ${fmtAmt(lineTotal)}`);
-      const p: any = waProductMap.get(item.product_id);
-      if (p?.whatsapp_group_url) {
-        lines.push(`   └ Group: ${p.whatsapp_group_url}`);
-      }
     }
     lines.push(``);
 
@@ -1921,6 +1930,44 @@ const PERIOD_INFO: Record<string, { field: string; months: number | null; name: 
   'one_time':  { field: 'price_1m', months: null, name: 'One-time' },
 };
 
+// Admin-writable product fields, shared by create and update. The three
+// list fields are jsonb arrays (CHECKed in migration 07): features and
+// how_it_works hold strings, faqs holds {q, a}. Blank entries are dropped so
+// an empty editor row never reaches the product page.
+const PRODUCT_WRITE_FIELDS = [
+  'name', 'slug', 'status', 'stock_status', 'price_1m', 'price_3m', 'price_6m', 'price_1y',
+  'category', 'tags', 'short_description', 'description', 'category_tagline',
+  'domain', 'billing_type', 'billing_period', 'featured', 'sort_order', 'image_url',
+  'whatsapp_group_url', 'social_links',
+  'badge', 'delivery_time', 'delivery_method', 'region', 'seo_title', 'seo_description',
+  'features', 'how_it_works', 'faqs',
+];
+
+function pickProductFields(body: any): { ok: true; fields: Record<string, any> } | { ok: false; error: string } {
+  const fields: Record<string, any> = {};
+  for (const key of PRODUCT_WRITE_FIELDS) {
+    if (body?.[key] !== undefined) fields[key] = body[key];
+  }
+  for (const key of ['features', 'how_it_works']) {
+    if (fields[key] === undefined) continue;
+    if (fields[key] === null) { fields[key] = []; continue; }
+    if (!Array.isArray(fields[key])) return { ok: false, error: `${key} must be a list` };
+    fields[key] = fields[key].map((s: any) => String(s ?? '').trim()).filter(Boolean).slice(0, 30);
+  }
+  if (fields.faqs !== undefined) {
+    if (fields.faqs === null) fields.faqs = [];
+    else if (!Array.isArray(fields.faqs)) return { ok: false, error: 'faqs must be a list' };
+    else fields.faqs = fields.faqs
+      .map((f: any) => ({ q: String(f?.q ?? '').trim(), a: String(f?.a ?? '').trim() }))
+      .filter((f: { q: string; a: string }) => f.q && f.a)
+      .slice(0, 30);
+  }
+  for (const key of ['badge', 'delivery_time', 'delivery_method', 'region', 'seo_title', 'seo_description']) {
+    if (typeof fields[key] === 'string') fields[key] = fields[key].trim() || null;
+  }
+  return { ok: true, fields };
+}
+
 function getPriceField(billingPeriod: string): string {
   return PERIOD_INFO[billingPeriod]?.field || 'price_3m';
 }
@@ -2147,15 +2194,9 @@ async function handleAdminUpdateProduct(
 
   const body = await request.json() as any;
 
-  const allowed = [
-    'name', 'slug', 'status', 'stock_status', 'price_1m', 'price_3m', 'price_6m', 'price_1y',
-    'category', 'tags', 'short_description', 'description', 'category_tagline',
-    'domain', 'billing_type', 'billing_period', 'featured', 'sort_order', 'image_url', 'whatsapp_group_url', 'social_links'
-  ];
-  const updates: Record<string, any> = {};
-  for (const key of allowed) {
-    if (body[key] !== undefined) updates[key] = body[key];
-  }
+  const picked = pickProductFields(body);
+  if (!picked.ok) return err(picked.error, 400, request, env);
+  const updates: Record<string, any> = picked.fields;
   updates.updated_at = new Date().toISOString();
 
   const { data, error: dbErr } = await db
@@ -3560,16 +3601,9 @@ async function handleAdminCreateProduct(
     return err(`Slug "${body.slug}" already exists`, 400, request, env);
   }
 
-  const allowed = [
-    'name', 'slug', 'status', 'stock_status', 'price_1m', 'price_3m', 'price_6m', 'price_1y',
-    'category', 'tags', 'short_description', 'description', 'category_tagline',
-    'domain', 'billing_type', 'billing_period', 'featured', 'sort_order', 'image_url',
-    'whatsapp_group_url', 'social_links',
-  ];
-  const insert: Record<string, any> = {};
-  for (const key of allowed) {
-    if (body[key] !== undefined) insert[key] = body[key];
-  }
+  const picked = pickProductFields(body);
+  if (!picked.ok) return err(picked.error, 400, request, env);
+  const insert: Record<string, any> = picked.fields;
   // Defaults
   if (!insert.status) insert.status = 'active';
   if (!insert.stock_status) insert.stock_status = 'in_stock';

@@ -40,6 +40,17 @@ export interface Product {
   sort_order: number;
   created_at: string;
   updated_at: string;
+  // Product-page content (supabase-migrations/07_product_merchandising.sql).
+  featured?: boolean | null;
+  badge?: string | null;
+  delivery_time?: string | null;
+  delivery_method?: string | null;
+  region?: string | null;
+  features?: string[];
+  how_it_works?: string[];
+  faqs?: { q: string; a: string }[];
+  seo_title?: string | null;
+  seo_description?: string | null;
 }
 
 // ── Cart (frontend → API) ──
