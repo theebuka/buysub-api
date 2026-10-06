@@ -3,15 +3,18 @@
 // ============================================================
 
 // ── Enums ──
-export type UserRole = 'user' | 'affiliate' | 'support_agent' | 'admin' | 'super_admin';
-export type OrderStatus = 'pending' | 'pending_manual' | 'paid' | 'failed' | 'refunded' | 'cancelled';
+// These mirror the Postgres enums (user_role, order_status, product_status).
+export type UserRole = 'user' | 'customer' | 'affiliate' | 'support_agent' | 'admin' | 'super_admin';
+// rejected_pending: stage one of a two-stage rejection, reversible via
+// /v2/admin/orders/:ref/undo-reject. Render it as a warning, not an error.
+export type OrderStatus = 'pending' | 'pending_manual' | 'paid' | 'failed' | 'refunded' | 'cancelled' | 'rejected_pending';
 export type PaymentMethod = 'paystack' | 'whatsapp' | 'bank_transfer' | 'cash' | 'wallet' | 'free';
 export type DiscountType = 'percentage' | 'fixed';
 export type DiscountScope = 'site_wide' | 'category';
 export type AffiliateStatus = 'pending' | 'approved' | 'suspended' | 'rejected';
 export type CommissionStatus = 'pending' | 'approved' | 'paid' | 'rejected';
 export type ProductStock = 'in_stock' | 'out_of_stock' | 'preorder';
-export type ProductStatus = 'active' | 'draft' | 'archived';
+export type ProductStatus = 'active' | 'hidden';
 export type BillingType = 'subscription' | 'one_time';
 
 // ── Products ──
@@ -46,7 +49,7 @@ export interface CartItemPayload {
   category: string | null;
   billing_period: string;          // "Quarterly" | "Biannual" | "Annual" | "One-time"
   billing_type: string;            // "subscription" | "one_time"
-  duration_months: number;
+  duration_months: number | null;  // null for One-time
   unit_price_ngn: number;
   quantity: number;
 }
@@ -126,6 +129,8 @@ export interface CreateOrderRequest {
   fx_rate: number;
   payment_method: 'paystack' | 'whatsapp';
   use_wallet?: boolean;
+  // The storefront sends referral_code; affiliate_code is the older name.
+  referral_code?: string;
   affiliate_code?: string;
 }
 
@@ -165,6 +170,14 @@ export interface DiscountValidateResponse {
   eligible_subtotal_ngn?: number;
   is_auto_apply?: boolean;
   is_exclusive?: boolean;
+  // Restrictions, so the storefront can mirror the charged amount exactly.
+  max_discount_ngn?: number | null;
+  min_order_ngn?: number;
+  included_products?: string | null;
+  excluded_products?: string | null;
+  included_categories?: string | null;
+  excluded_categories?: string | null;
+  scope?: DiscountScope;
 }
 
 export interface AutoApplyResponse {
@@ -181,6 +194,8 @@ export interface AutoApplyResponse {
     excluded_categories: string | null;
     scope: DiscountScope;
     exclusive: boolean;
+    is_exclusive: boolean;
+    is_auto_apply: true;
   }>;
 }
 

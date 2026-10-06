@@ -268,30 +268,32 @@ export default {
       if (path === '/v2/notifications' && method === 'GET') {
         const now = new Date().toISOString()
       
-        // extract user (if logged in)
+        // Audience is decided by who is asking: anonymous visitors get 'all',
+        // signed-in users add 'users', staff add 'admins'.
         const token = request.headers.get('Authorization')?.replace('Bearer ', '')
-        let role = 'public'
-      
+        const audiences = ['all']
+
         if (token) {
           const { data: userData } = await db.auth.getUser(token)
           const userId = userData?.user?.id
-      
+
           if (userId) {
             const { data: profile } = await db
               .from('profiles')
               .select('role')
               .eq('id', userId)
               .single()
-      
-            role = profile?.role === 'admin' ? 'admins' : 'users'
+
+            audiences.push('users')
+            if (STAFF_ROLES.includes(profile?.role)) audiences.push('admins')
           }
         }
-      
+
         const { data, error } = await db
           .from('notifications')
           .select('*')
           .eq('active', true)
-          .in('audience', ['all', 'users', 'admins'])
+          .in('audience', audiences)
 
         if (error) return err(error.message, 500, request, env)
 
@@ -338,7 +340,8 @@ export default {
       
         const id = path.split('/').pop()
         const body = await request.json().catch(() => null) as any
-      
+        if (typeof body?.active !== 'boolean') return err('active (boolean) is required', 400, request, env)
+
         const { data, error } = await db
           .from('notifications')
           .update({ active: body.active })
@@ -493,15 +496,15 @@ export default {
 async function handleGetProducts(
   db: SupabaseClient, url: URL, request: Request, env: Env,
 ): Promise<Response> {
+  // Public endpoint: only active products. Admins list hidden ones via /v2/admin/products.
   const category = url.searchParams.get('category');
-  const status = url.searchParams.get('status') || 'active';
-  const limit = Math.min(parseInt(url.searchParams.get('limit') || '500'), 1000);
-  const offset = parseInt(url.searchParams.get('offset') || '0');
+  const limit = Math.min(Math.max(1, parseInt(url.searchParams.get('limit') || '500') || 500), 1000);
+  const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0') || 0);
 
   let query = db.from('products')
     .select('*', { count: 'exact' })
     .is('deleted_at', null)
-    .eq('status', status)
+    .eq('status', 'active')
     .order('sort_order', { ascending: true })
     .order('name', { ascending: true })
     .limit(limit);
@@ -529,6 +532,7 @@ async function handleGetProductBySlug(
   const { data, error } = await db.from('products')
     .select('*')
     .eq('slug', slug)
+    .eq('status', 'active')
     .is('deleted_at', null)
     .single();
 
@@ -583,6 +587,13 @@ async function handleValidateDiscount(
     eligible_subtotal_ngn: result.eligible_subtotal_ngn,
     is_auto_apply: discount.auto_apply,
     is_exclusive: discount.exclusive,
+    max_discount_ngn: discount.max_discount_ngn,
+    min_order_ngn: discount.min_order_ngn,
+    included_products: discount.included_products,
+    excluded_products: discount.excluded_products,
+    included_categories: discount.included_categories,
+    excluded_categories: discount.excluded_categories,
+    scope: discount.scope,
   }, request, env);
 }
 
@@ -600,7 +611,15 @@ async function handleAutoApplyDiscounts(
 
   if (error) return err(error.message, 500, request, env);
 
-  const discounts = (data || []).map((d: any) => ({
+  // Only codes that would pass the date and usage guards right now. Min order
+  // and eligibility depend on the cart, so the storefront checks those.
+  const now = new Date();
+  const live = (data || []).filter((d: any) =>
+    (!d.active_from || new Date(d.active_from) <= now) &&
+    (!d.expires_at || new Date(d.expires_at) >= now) &&
+    (d.max_uses == null || d.times_used < d.max_uses));
+
+  const discounts = live.map((d: any) => ({
     code: d.code,
     type: d.type,
     value: d.value,
@@ -613,6 +632,9 @@ async function handleAutoApplyDiscounts(
     excluded_categories: d.excluded_categories,
     scope: d.scope,
     exclusive: d.exclusive,
+    // The storefront reads is_* names, matching /v2/discount/validate.
+    is_exclusive: d.exclusive,
+    is_auto_apply: true,
   }));
 
   return ok({ discounts }, request, env);
@@ -620,131 +642,181 @@ async function handleAutoApplyDiscounts(
 
 
 // ============================================================
-// HANDLER: POST /v2/orders  (Paystack checkout)
+// SHARED: validate a public order payload against the DB
 // ============================================================
-async function handleCreateOrder(
-  db: SupabaseClient, request: Request, env: Env,
-): Promise<Response> {
-  try {
-    const body = await request.json() as CreateOrderRequest;
+// Both public order paths go through this, so neither trusts the client for
+// prices, names, categories (discount eligibility reads them), quantities or
+// the promo code. A promo code that no longer applies fails the order with a
+// reason instead of being dropped silently — otherwise the customer would be
+// charged more than the cart showed them.
 
-  // Validate required fields
-  if (!body.customer_email || !body.items?.length) {
-    return err('Email and items are required', 400, request, env);
-  }
+const MAX_LINE_QTY = 100;
+const MAX_LINES = 50;
+const SUPPORTED_CURRENCIES = ['NGN', 'USD', 'GBP', 'CAD'];
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-  // ── Server-side price validation ──
-  const productIds = body.items.map(i => i.product_id);
+type PreparedOrder = {
+  email: string;
+  items: CartItemPayload[];
+  subtotalNGN: number;
+  discountNGN: number;
+  discountCode: string | null;
+  affiliateId: string | null;
+  referralCode: string | null;
+  currency: string;
+  fxRate: number;
+};
+
+async function prepareOrder(
+  db: SupabaseClient, body: CreateOrderRequest, request: Request, env: Env,
+): Promise<{ ok: true; order: PreparedOrder } | { ok: false; response: Response }> {
+  const fail = (msg: string, status = 400) => ({ ok: false as const, response: err(msg, status, request, env) });
+
+  const email = String(body?.customer_email || '').trim().toLowerCase();
+  if (!EMAIL_RE.test(email)) return fail('A valid email is required');
+  if (!Array.isArray(body.items) || body.items.length === 0) return fail('Email and items are required');
+  if (body.items.length > MAX_LINES) return fail(`At most ${MAX_LINES} items per order`);
+
+  const productIds = [...new Set(body.items.map(i => i?.product_id).filter(Boolean))];
   const { data: products, error: pErr } = await db.from('products')
     .select('*')
-    .in('id', productIds);
-
-  if (pErr || !products?.length) {
-    return err('Could not validate product prices', 400, request, env);
-  }
+    .in('id', productIds)
+    .is('deleted_at', null);
+  if (pErr || !products?.length) return fail('Could not validate product prices');
 
   const productMap = new Map(products.map((p: any) => [p.id, p]));
-  let serverSubtotal = 0;
+  const items: CartItemPayload[] = [];
+  let subtotalNGN = 0;
 
-  for (const item of body.items) {
-    const product = productMap.get(item.product_id);
-    if (!product) return err(`Product ${item.product_name} not found`, 400, request, env);
-    if (product.stock_status !== 'in_stock') {
-      return err(`${item.product_name} is out of stock`, 400, request, env);
+  for (const raw of body.items) {
+    const product: any = productMap.get(raw?.product_id);
+    if (!product || product.status !== 'active') return fail(`${raw?.product_name || 'A product'} is no longer available`);
+    if (product.stock_status !== 'in_stock') return fail(`${product.name} is out of stock`);
+
+    const quantity = Number(raw.quantity);
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_LINE_QTY) {
+      return fail(`Invalid quantity for ${product.name}`);
     }
-    // Validate unit price against DB
-    const priceField = getPriceField(item.billing_period);
-    const dbPrice = product[priceField];
-    if (dbPrice == null) {
-      return err(`${item.product_name} is not available for ${item.billing_period}`, 400, request, env);
+
+    const period = PERIOD_INFO[raw.billing_period];
+    if (!period) return fail(`Unknown billing period for ${product.name}`);
+    const dbPrice = product[period.field];
+    if (dbPrice == null) return fail(`${product.name} is not available for ${raw.billing_period}`);
+    if (Math.abs(Number(raw.unit_price_ngn) - dbPrice) > 1) {
+      return fail(`Price for ${product.name} has changed. Refresh the page to see the current price.`);
     }
-    if (Math.abs(item.unit_price_ngn - dbPrice) > 1) {
-      return err(`Price mismatch for ${item.product_name}. Expected ₦${dbPrice}, got ₦${item.unit_price_ngn}`, 400, request, env);
-    }
-    item.unit_price_ngn = dbPrice; // use DB price
-    serverSubtotal += dbPrice * item.quantity;
+
+    items.push({
+      product_id: product.id,
+      product_name: product.name,
+      category: product.category,
+      billing_period: period.name,
+      billing_type: product.billing_type,
+      duration_months: period.months,
+      unit_price_ngn: dbPrice,
+      quantity,
+    });
+    subtotalNGN += dbPrice * quantity;
   }
 
-  // ── Discount validation (server-side) ──
+  // ── Discount (server-side, authoritative) ──
   let discountNGN = 0;
   let discountCode: string | null = null;
-  if (body.discount_code) {
+  const requestedCode = String(body.discount_code || '').trim().toUpperCase();
+  if (requestedCode) {
     const { data: disc } = await db.from('discount_codes')
       .select('*')
-      .eq('code', body.discount_code.toUpperCase())
-      .single();
+      .eq('code', requestedCode)
+      .maybeSingle();
+    if (!disc) return fail(`Promo code ${requestedCode} is no longer valid. Remove it and try again.`);
 
-    if (disc) {
-      const result = validateAndCalcDiscount(disc as DiscountCode, body.items, !disc.auto_apply);
-      if (result.valid) {
-        discountNGN = result.discount_ngn;
-        discountCode = disc.code;
-      }
-      // If invalid, we silently ignore (don't block the order)
+    const result = validateAndCalcDiscount(disc as DiscountCode, items, !disc.auto_apply);
+    if (!result.valid) return fail(`Promo code ${requestedCode}: ${result.error} Remove it and try again.`);
+
+    // One use per customer (discount_usages is unique on discount_id + customer_id).
+    const { data: existingCustomer } = await db.from('customers')
+      .select('id')
+      .ilike('email', escapeLike(email))
+      .limit(1);
+    if (existingCustomer?.length) {
+      const { data: used } = await db.from('discount_usages')
+        .select('id')
+        .eq('discount_id', disc.id)
+        .eq('customer_id', existingCustomer[0].id)
+        .limit(1);
+      if (used?.length) return fail(`You've already used promo code ${requestedCode}. Remove it and try again.`);
     }
+
+    discountNGN = result.discount_ngn;
+    discountCode = disc.code;
   }
 
-  // ── Wallet deduction ──
-  let walletNGN = 0;
-  // Wallet is handled during paystack init, not here
-
-  // ── Affiliate lookup ──
+  // ── Affiliate (codes are stored upper-case) ──
   let affiliateId: string | null = null;
-  if (body.affiliate_code) {
+  let referralCode: string | null = null;
+  const refCode = String(body.referral_code || body.affiliate_code || '').trim().toUpperCase();
+  if (refCode) {
     const { data: aff } = await db.from('affiliates')
-      .select('id, user_id')
-      .eq('referral_code', body.affiliate_code)
+      .select('id')
+      .eq('referral_code', refCode)
       .eq('status', 'approved')
-      .single();
-
+      .maybeSingle();
     if (aff) {
-      // Self-referral check: match affiliate's user_id to customer email
-      // (customer may not have account, so we check email match via customers table)
       affiliateId = aff.id;
+      referralCode = refCode;
     }
   }
 
-  const totalNGN = Math.max(0, serverSubtotal - discountNGN);
+  const currency = SUPPORTED_CURRENCIES.includes(body.currency) ? body.currency : 'NGN';
+  const fxRate = Number(body.fx_rate) > 0 && Number.isFinite(Number(body.fx_rate)) ? Number(body.fx_rate) : 1;
 
-  // ── Find or create customer ──
+  return {
+    ok: true,
+    order: { email, items, subtotalNGN, discountNGN, discountCode, affiliateId, referralCode, currency, fxRate: currency === 'NGN' ? 1 : fxRate },
+  };
+}
+
+async function insertOrderWithItems(
+  db: SupabaseClient, prepared: PreparedOrder, body: CreateOrderRequest,
+  status: 'pending' | 'pending_manual', paymentMethod: 'paystack' | 'whatsapp',
+): Promise<{ order: any; orderRef: string; totalNGN: number } | { error: string }> {
+  const totalNGN = Math.max(0, prepared.subtotalNGN - prepared.discountNGN);
+
   const customerId = await findOrCreateCustomer(db, {
-    email: body.customer_email,
+    email: prepared.email,
     name: body.customer_name,
     phone: body.customer_phone,
-    source: body.payment_method,
+    source: paymentMethod,
   });
 
-  // ── Generate order ref ──
-  const { data: refData } = await db.rpc('generate_order_ref');
+  const { data: refData, error: refErr } = await db.rpc('generate_order_ref');
+  if (refErr || !refData) return { error: 'Could not generate an order reference' };
   const orderRef = refData as string;
 
-  // ── Create order ──
   const { data: order, error: oErr } = await db.from('orders').insert({
     order_ref: orderRef,
     customer_id: customerId,
-    customer_email: body.customer_email,
+    customer_email: prepared.email,
     customer_name: body.customer_name || null,
     customer_phone: body.customer_phone || null,
-    status: 'pending',
-    payment_method: body.payment_method,
-    subtotal_ngn: serverSubtotal,
-    discount_ngn: discountNGN,
-    wallet_ngn: walletNGN,
+    status,
+    payment_method: paymentMethod,
+    subtotal_ngn: prepared.subtotalNGN,
+    discount_ngn: prepared.discountNGN,
+    wallet_ngn: 0,
     tax_ngn: 0,
     total_ngn: totalNGN,
-    currency: body.currency || 'NGN',
-    fx_rate: body.fx_rate || 1,
-    display_total: totalNGN * (body.fx_rate || 1),
-    discount_code: discountCode,
-    affiliate_id: affiliateId,
+    currency: prepared.currency,
+    fx_rate: prepared.fxRate,
+    display_total: totalNGN * prepared.fxRate,
+    discount_code: prepared.discountCode,
+    affiliate_id: prepared.affiliateId,
+    referral_code: prepared.referralCode,
   }).select().single();
 
-  if (oErr || !order) {
-    return err('Failed to create order: ' + (oErr?.message || 'unknown'), 500, request, env);
-  }
+  if (oErr || !order) return { error: 'Failed to create order: ' + (oErr?.message || 'unknown') };
 
-  // ── Insert order items ──
-  const orderItems = body.items.map(item => ({
+  const { error: iErr } = await db.from('order_items').insert(prepared.items.map(item => ({
     order_id: order.id,
     product_id: item.product_id,
     product_name: item.product_name,
@@ -755,24 +827,47 @@ async function handleCreateOrder(
     unit_price_ngn: item.unit_price_ngn,
     quantity: item.quantity,
     total_price_ngn: item.unit_price_ngn * item.quantity,
-  }));
+  })));
 
-  await db.from('order_items').insert(orderItems);
+  if (iErr) {
+    // An order with no lines can't be fulfilled or receipted; don't leave it behind.
+    await db.from('orders').delete().eq('id', order.id);
+    return { error: 'Failed to save order items: ' + iErr.message };
+  }
 
-  // ── Log event ──
   await logEvent(db, 'order', order.id, 'created', null, {
     order_ref: orderRef,
-    payment_method: body.payment_method,
+    payment_method: paymentMethod,
     total_ngn: totalNGN,
   });
 
-  return ok({
-    order_id: order.id,
-    order_ref: orderRef,
-    total_ngn: totalNGN,
-    discount_ngn: discountNGN,
-    status: 'pending',
-  }, request, env);
+  return { order, orderRef, totalNGN };
+}
+
+
+// ============================================================
+// HANDLER: POST /v2/orders  (Paystack checkout)
+// ============================================================
+async function handleCreateOrder(
+  db: SupabaseClient, request: Request, env: Env,
+): Promise<Response> {
+  try {
+    const body = await request.json().catch(() => null) as CreateOrderRequest | null;
+    if (!body) return err('Invalid request body', 400, request, env);
+
+    const prepared = await prepareOrder(db, body, request, env);
+    if (!prepared.ok) return prepared.response;
+
+    const created = await insertOrderWithItems(db, prepared.order, body, 'pending', 'paystack');
+    if ('error' in created) return err(created.error, 500, request, env);
+
+    return ok({
+      order_id: created.order.id,
+      order_ref: created.orderRef,
+      total_ngn: created.totalNGN,
+      discount_ngn: prepared.order.discountNGN,
+      status: 'pending',
+    }, request, env);
   } catch (e: any) {
     console.error('Create order error:', e);
     return err('Failed to process order: ' + (e?.message || 'unknown error'), 500, request, env);
@@ -787,146 +882,46 @@ async function handleWhatsAppOrder(
   db: SupabaseClient, request: Request, env: Env,
 ): Promise<Response> {
   try {
-    const body = await request.json() as CreateOrderRequest;
+    const body = await request.json().catch(() => null) as CreateOrderRequest | null;
+    if (!body) return err('Invalid request body', 400, request, env);
 
-    if (!body.customer_email || !body.items?.length) {
-      return err('Email and items are required', 400, request, env);
-    }
+    const prepared = await prepareOrder(db, body, request, env);
+    if (!prepared.ok) return prepared.response;
 
-    // Server-side price validation
-    const productIds = body.items.map(i => i.product_id);
-    const { data: products } = await db.from('products')
-      .select('*')
-      .in('id', productIds);
+    const created = await insertOrderWithItems(db, prepared.order, body, 'pending_manual', 'whatsapp');
+    if ('error' in created) return err(created.error, 500, request, env);
 
-    if (!products?.length) {
-      return err('Could not validate products', 400, request, env);
-    }
-
-    const productMap = new Map(products.map((p: any) => [p.id, p]));
-    let serverSubtotal = 0;
-
-    for (const item of body.items) {
-      const product = productMap.get(item.product_id);
-      if (!product) return err(`Product ${item.product_name} not found`, 400, request, env);
-      const priceField = getPriceField(item.billing_period);
-      const dbPrice = product[priceField];
-      if (dbPrice != null) item.unit_price_ngn = dbPrice;
-      serverSubtotal += item.unit_price_ngn * item.quantity;
-    }
-
-    // Discount validation
-    let discountNGN = 0;
-    let discountCode: string | null = null;
-    if (body.discount_code) {
-      const { data: disc } = await db.from('discount_codes')
-        .select('*').eq('code', body.discount_code.toUpperCase()).single();
-      if (disc) {
-        const result = validateAndCalcDiscount(disc as DiscountCode, body.items, !disc.auto_apply);
-        if (result.valid) {
-          discountNGN = result.discount_ngn;
-          discountCode = disc.code;
-        }
-      }
-    }
-
-    // Affiliate
-    let affiliateId: string | null = null;
-    if (body.affiliate_code) {
-      const { data: aff } = await db.from('affiliates')
-        .select('id').eq('referral_code', body.affiliate_code).eq('status', 'approved').single();
-      if (aff) affiliateId = aff.id;
-    }
-
-    const totalNGN = Math.max(0, serverSubtotal - discountNGN);
-
-    // Find or create customer
-    let customerId: string | null = null;
-    try {
-      customerId = await findOrCreateCustomer(db, {
-        email: body.customer_email,
-        name: body.customer_name,
-        phone: body.customer_phone,
-        source: 'whatsapp',
-      });
-    } catch (e: any) {
-      console.error('Customer creation failed:', e);
-    }
-
-    // Generate order ref
-    const { data: refData } = await db.rpc('generate_order_ref');
-    const orderRef = refData as string;
-
-    // Create order as pending_manual
-    const { data: order, error: oErr } = await db.from('orders').insert({
-      order_ref: orderRef,
-      customer_id: customerId,
-      customer_email: body.customer_email,
-      customer_name: body.customer_name || null,
-      customer_phone: body.customer_phone || null,
-      status: 'pending_manual',
-      payment_method: 'whatsapp',
-      subtotal_ngn: serverSubtotal,
-      discount_ngn: discountNGN,
-      tax_ngn: 0,
-      total_ngn: totalNGN,
-      currency: body.currency || 'NGN',
-      fx_rate: body.fx_rate || 1,
-      display_total: totalNGN * (body.fx_rate || 1),
-      discount_code: discountCode,
-      affiliate_id: affiliateId,
-    }).select().single();
-
-    if (oErr || !order) {
-      return err('Failed to create order: ' + (oErr?.message || 'unknown'), 500, request, env);
-    }
-
-    // Insert order items
-    const orderItems = body.items.map(item => ({
-      order_id: order.id,
-      product_id: item.product_id,
-      product_name: item.product_name,
-      category: item.category,
-      duration_months: item.duration_months,
-      billing_period: item.billing_period,
-      billing_type: item.billing_type,
-      unit_price_ngn: item.unit_price_ngn,
-      quantity: item.quantity,
-      total_price_ngn: item.unit_price_ngn * item.quantity,
-    }));
-
-    await db.from('order_items').insert(orderItems);
+    const { orderRef, totalNGN } = created;
+    const { items, subtotalNGN: serverSubtotal, discountNGN, discountCode, currency, fxRate } = prepared.order;
 
     // Build WhatsApp message for admin
     // Fetch product WA/social links for items
-    const waProductIds = body.items.map(i => i.product_id);
+    const waProductIds = items.map(i => i.product_id);
     const { data: waProducts } = await db
       .from('products')
       .select('id, whatsapp_group_url, social_links')
       .in('id', waProductIds);
     const waProductMap = new Map((waProducts || []).map((p: any) => [p.id, p]));
-    
-    const fxRate = body.fx_rate || 1;
-    const currency = body.currency || 'NGN';
+
     const fmtAmt = (v: number) => {
       if (currency === 'NGN') return `₦${Math.ceil(v).toLocaleString()}`;
       return `${currency} ${(v * fxRate).toFixed(2)}`;
     };
-    
+
     const whatsappNumber = env.WHATSAPP_NUMBER || '2348107872916';
     const frontendUrl = env.FRONTEND_URL || 'https://app.buysub.ng';
-    
+
     const lines: string[] = [
       `🛒 *New WhatsApp Order*`, ``,
       `Order Ref: *${orderRef}*`,
-      `Customer: ${body.customer_email}`,
+      `Customer: ${prepared.order.email}`,
       body.customer_name ? `Name: ${body.customer_name}` : '',
       body.customer_phone ? `Phone: ${body.customer_phone}` : '',
       `Currency: ${currency}`, ``,
       `*Items:*`,
     ];
-    
-    for (const item of body.items) {
+
+    for (const item of items) {
       const lineTotal = item.unit_price_ngn * item.quantity;
       lines.push(`• ${item.product_name} ×${item.quantity} (${item.billing_period}) — ${fmtAmt(lineTotal)}`);
       const p: any = waProductMap.get(item.product_id);
@@ -935,7 +930,7 @@ async function handleWhatsAppOrder(
       }
     }
     lines.push(``);
-    
+
     if (discountNGN > 0 && discountCode) {
       lines.push(`Subtotal: ${fmtAmt(serverSubtotal)}`);
       lines.push(`Promo (${discountCode}): -${fmtAmt(discountNGN)}`);
@@ -943,18 +938,12 @@ async function handleWhatsAppOrder(
     lines.push(`*Total: ${fmtAmt(totalNGN)}*`, ``);
     lines.push(`⚠️ Status: Pending Manual Approval`);
     lines.push(`Approve at: ${frontendUrl}/admin/orders/${orderRef}`);
-    
+
     const message = lines.filter(Boolean).join('\n');
     const whatsappUrl = `https://wa.me/${whatsappNumber}?text=${encodeURIComponent(message)}`;
 
-    await logEvent(db, 'order', order.id, 'created', null, {
-      order_ref: orderRef,
-      payment_method: 'whatsapp',
-      total_ngn: totalNGN,
-    });
-
     return ok({
-      order_id: order.id,
+      order_id: created.order.id,
       order_ref: orderRef,
       total_ngn: totalNGN,
       whatsapp_url: whatsappUrl,
@@ -969,14 +958,102 @@ async function handleWhatsAppOrder(
 
 
 // ============================================================
+// PAYSTACK HELPERS
+// ============================================================
+
+async function paystackVerifyTx(reference: string, env: Env): Promise<any | null> {
+  try {
+    const res = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, {
+      headers: { Authorization: `Bearer ${env.PAYSTACK_SECRET_KEY}` },
+    });
+    const json = await res.json() as any;
+    return json?.status ? json.data : null;
+  } catch {
+    return null;
+  }
+}
+
+// Turn a successful Paystack transaction into a paid order. Shared by the
+// webhook, /v2/pay/verify and /v2/pay/init (an earlier attempt already paid).
+// 'mismatch' means Paystack took less than the order total, or another currency.
+async function settlePaystackPayment(
+  db: SupabaseClient, order: any, tx: any, env: Env,
+): Promise<'ok' | 'already' | 'ignored' | 'mismatch'> {
+  if (tx?.status !== 'success') return 'ignored';
+
+  const expectedKobo = Math.round(Number(order.total_ngn) * 100);
+  if (tx.currency !== 'NGN' || Number(tx.amount) < expectedKobo) {
+    await logEvent(db, 'order', order.id, 'payment_amount_mismatch', null, {
+      order_ref: order.order_ref,
+      reference: tx.reference,
+      expected_kobo: expectedKobo,
+      paid_kobo: tx.amount,
+      currency: tx.currency,
+    });
+    return 'mismatch';
+  }
+
+  // The order may have been re-initialised since this attempt; record which reference paid.
+  if (order.paystack_ref !== tx.reference) {
+    await db.from('orders').update({ paystack_ref: tx.reference }).eq('id', order.id);
+  }
+
+  const transitioned = await fulfillOrder(db, order.id, 'paystack', env);
+  return transitioned ? 'ok' : 'already';
+}
+
+async function findOrderForTx(db: SupabaseClient, tx: any): Promise<any | null> {
+  const { data: byRef } = await db.from('orders')
+    .select('*').eq('paystack_ref', tx.reference).maybeSingle();
+  if (byRef) return byRef;
+  // Earlier attempts' references are overwritten on re-init; metadata still has the id.
+  const orderId = tx?.metadata?.order_id;
+  if (!orderId) return null;
+  const { data: byId } = await db.from('orders').select('*').eq('id', orderId).maybeSingle();
+  return byId ?? null;
+}
+
+// Paystack redirects here after payment, so only allow our own origins.
+function safeCallbackUrl(requested: string | undefined, env: Env): string {
+  const fallback = `${env.FRONTEND_URL}/order/verify`;
+  if (!requested) return fallback;
+  try {
+    const u = new URL(requested);
+    const allowed = [env.FRONTEND_URL, ...(env.ALLOWED_ORIGINS?.split(',') || [])]
+      .map(s => s?.trim()).filter(Boolean)
+      .map(s => { try { return new URL(s).origin; } catch { return ''; } });
+    return allowed.includes(u.origin) ? u.toString() : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function refundWalletForOrder(db: SupabaseClient, order: any, amount: number, reason: string): Promise<void> {
+  if (!(amount > 0) || !order.customer_id) return;
+  const { data: customer } = await db.from('customers').select('user_id').eq('id', order.customer_id).maybeSingle();
+  if (!customer?.user_id) return;
+  const { data: wallet } = await db.from('wallets').select('id').eq('user_id', customer.user_id).maybeSingle();
+  if (!wallet) return;
+  const { error } = await db.rpc('credit_wallet', {
+    p_wallet_id: wallet.id,
+    p_amount: amount,
+    p_reference: `${order.order_ref} ${reason}`,
+    p_source: 'refund',
+  });
+  if (error) console.error('Wallet refund failed:', order.order_ref, error.message);
+  else await logEvent(db, 'order', order.id, 'wallet_refunded', null, { amount_ngn: amount, reason });
+}
+
+
+// ============================================================
 // HANDLER: POST /v2/pay/init  (Paystack)
 // ============================================================
 async function handlePaystackInit(
   db: SupabaseClient, request: Request, env: Env,
 ): Promise<Response> {
-  const body = await request.json() as PaystackInitRequest & { use_wallet?: boolean };
+  const body = await request.json().catch(() => null) as (PaystackInitRequest & { use_wallet?: boolean }) | null;
 
-  if (!body.order_id) return err('order_id is required', 400, request, env);
+  if (!body?.order_id) return err('order_id is required', 400, request, env);
 
   // Fetch order
   const { data: order, error: oErr } = await db.from('orders')
@@ -987,11 +1064,24 @@ async function handlePaystackInit(
 
   if (oErr || !order) return err('Order not found or already processed', 404, request, env);
 
-  let amountToCharge = order.total_ngn;
+  // An earlier attempt (another tab, a retry) may already have been paid.
+  // Settle it rather than charging the customer a second time.
+  if (order.paystack_ref) {
+    const prior = await paystackVerifyTx(order.paystack_ref, env);
+    if (prior?.status === 'success') {
+      const settled = await settlePaystackPayment(db, order, prior, env);
+      if (settled === 'ok' || settled === 'already') {
+        return ok({ already_paid: true, order_ref: order.order_ref }, request, env);
+      }
+    }
+  }
+
+  const originalTotal = Number(order.total_ngn);
+  let amountToCharge = originalTotal;
   let walletDeducted = 0;
 
-  // ── Wallet deduction (explicit opt-in) ──
-  if (body.use_wallet && order.customer_id) {
+  // ── Wallet deduction (explicit opt-in, at most once per order) ──
+  if (body.use_wallet && order.customer_id && !(Number(order.wallet_ngn) > 0)) {
     const { data: customer } = await db.from('customers')
       .select('user_id').eq('id', order.customer_id).single();
 
@@ -999,62 +1089,85 @@ async function handlePaystackInit(
       const { data: wallet } = await db.from('wallets')
         .select('*').eq('user_id', customer.user_id).single();
 
-      if (wallet && wallet.balance_ngn > 0) {
-        walletDeducted = Math.min(wallet.balance_ngn, amountToCharge);
-        // Debit wallet
-        await db.rpc('debit_wallet', {
-          p_wallet_id: wallet.id,
-          p_amount: walletDeducted,
-          p_reference: order.order_ref,
-        });
-        amountToCharge -= walletDeducted;
+      if (wallet && wallet.is_active !== false && Number(wallet.balance_ngn) > 0) {
+        const amount = Math.min(Number(wallet.balance_ngn), amountToCharge);
 
-        // Update order
-        await db.from('orders').update({
-          wallet_ngn: walletDeducted,
-          total_ngn: amountToCharge,
-        }).eq('id', order.id);
+        // Claim the deduction on the order first, so two concurrent inits can't both debit.
+        const { data: claimed } = await db.from('orders')
+          .update({ wallet_ngn: amount, total_ngn: amountToCharge - amount })
+          .eq('id', order.id)
+          .eq('status', 'pending')
+          .or('wallet_ngn.is.null,wallet_ngn.eq.0')
+          .select('id');
+
+        if (claimed?.length) {
+          const { error: debitErr } = await db.rpc('debit_wallet', {
+            p_wallet_id: wallet.id,
+            p_amount: amount,
+            p_reference: order.order_ref,
+          });
+          if (debitErr) {
+            await db.from('orders').update({ wallet_ngn: 0, total_ngn: originalTotal }).eq('id', order.id);
+            return err('Could not use your wallet balance: ' + debitErr.message, 409, request, env);
+          }
+          walletDeducted = amount;
+          amountToCharge -= amount;
+        }
       }
     }
   }
 
   // If fully paid by wallet
   if (amountToCharge <= 0) {
-    await fulfillOrder(db, order.id, 'wallet', env);
+    await fulfillOrder(db, order.id, 'wallet', env, ['pending']);
     return ok({
       fully_paid_by_wallet: true,
       order_ref: order.order_ref,
     }, request, env);
   }
 
+  // Undo the wallet part of this attempt if Paystack can't be started.
+  const undoWallet = async () => {
+    if (walletDeducted <= 0) return;
+    await refundWalletForOrder(db, order, walletDeducted, 'paystack init failed');
+    await db.from('orders').update({ wallet_ngn: 0, total_ngn: originalTotal }).eq('id', order.id);
+  };
+
   // ── Init Paystack transaction ──
   const paystackRef = `BS-${order.order_ref}-${Date.now()}`;
 
-  const paystackRes = await fetch('https://api.paystack.co/transaction/initialize', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.PAYSTACK_SECRET_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      email: order.customer_email,
-      amount: Math.round(amountToCharge * 100), // Paystack uses kobo
-      reference: paystackRef,
-      callback_url: body.callback_url || `${env.FRONTEND_URL}/order/verify`,
-      metadata: {
-        order_id: order.id,
-        order_ref: order.order_ref,
-        custom_fields: [
-          { display_name: 'Order Ref', variable_name: 'order_ref', value: order.order_ref },
-        ],
+  let paystackData: any = null;
+  try {
+    const paystackRes = await fetch('https://api.paystack.co/transaction/initialize', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.PAYSTACK_SECRET_KEY}`,
+        'Content-Type': 'application/json',
       },
-    }),
-  });
+      body: JSON.stringify({
+        email: order.customer_email,
+        amount: Math.round(amountToCharge * 100), // Paystack uses kobo
+        currency: 'NGN',
+        reference: paystackRef,
+        callback_url: safeCallbackUrl(body.callback_url, env),
+        metadata: {
+          order_id: order.id,
+          order_ref: order.order_ref,
+          custom_fields: [
+            { display_name: 'Order Ref', variable_name: 'order_ref', value: order.order_ref },
+          ],
+        },
+      }),
+    });
+    paystackData = await paystackRes.json();
+  } catch (e: any) {
+    await undoWallet();
+    return err('Payment initialization failed: ' + (e?.message || 'network error'), 502, request, env);
+  }
 
-  const paystackData = await paystackRes.json() as any;
-
-  if (!paystackData.status) {
-    return err('Payment initialization failed: ' + (paystackData.message || 'Unknown error'), 500, request, env);
+  if (!paystackData?.status) {
+    await undoWallet();
+    return err('Payment initialization failed: ' + (paystackData?.message || 'Unknown error'), 500, request, env);
   }
 
   // Save paystack ref on order
@@ -1090,40 +1203,38 @@ async function handlePaystackWebhook(
     return new Response('OK', { status: 200 });
   }
 
-  const reference = event.data.reference;
+  const tx = event.data;
+  const reference = tx.reference;
 
-  // ── Idempotency check ──
-  const { data: existing } = await db.from('payment_events')
-    .select('id')
-    .eq('payment_reference', reference)
-    .single();
-
-  if (existing) {
-    return new Response('Already processed', { status: 200 });
+  // ── Idempotency: the unique index on payment_reference is the lock ──
+  const { error: peErr } = await db.from('payment_events').insert({
+    payment_reference: reference,
+    status: tx.status,
+    amount_ngn: tx.amount / 100, // kobo → NGN
+    provider: 'paystack',
+    raw_payload: tx,
+  });
+  if (peErr) {
+    if (peErr.code === '23505') return new Response('Already processed', { status: 200 });
+    console.error('Webhook: could not record payment event', peErr.message);
+    return new Response('Retry', { status: 500 });
   }
 
-  // ── Record payment event ──
-  await db.from('payment_events').insert({
-    payment_reference: reference,
-    status: event.data.status,
-    amount_ngn: event.data.amount / 100, // kobo → NGN
-    provider: 'paystack',
-    raw_payload: event.data,
-  });
-
-  // ── Find order by paystack reference ──
-  const { data: order } = await db.from('orders')
-    .select('*')
-    .eq('paystack_ref', reference)
-    .single();
-
+  const order = await findOrderForTx(db, tx);
   if (!order) {
     console.error(`Webhook: No order found for reference ${reference}`);
     return new Response('OK', { status: 200 });
   }
 
-  // ── Fulfill order (async, non-blocking) ──
-  ctx.waitUntil(fulfillOrder(db, order.id, 'paystack', env));
+  // Fulfil before answering, so a failure gets a non-200 and Paystack retries.
+  try {
+    await settlePaystackPayment(db, order, tx, env);
+  } catch (e: any) {
+    console.error('Webhook fulfilment failed:', e?.message);
+    // Release the idempotency row so the retry is processed.
+    await db.from('payment_events').delete().eq('payment_reference', reference);
+    return new Response('Retry', { status: 500 });
+  }
 
   return new Response('OK', { status: 200 });
 }
@@ -1132,32 +1243,37 @@ async function handlePaystackWebhook(
 // ============================================================
 // HANDLER: GET /v2/pay/verify?reference=xxx
 // ============================================================
+// Also settles the order, so a missed or delayed webhook doesn't leave a paid
+// order pending. fulfillOrder is idempotent, so racing the webhook is safe.
 async function handlePaystackVerify(
   db: SupabaseClient, reference: string | null, request: Request, env: Env,
 ): Promise<Response> {
   if (!reference) return err('Reference is required', 400, request, env);
 
-  const paystackRes = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, {
-    headers: { Authorization: `Bearer ${env.PAYSTACK_SECRET_KEY}` },
-  });
-
-  const data = await paystackRes.json() as any;
-
-  if (!data.status || data.data?.status !== 'success') {
+  const tx = await paystackVerifyTx(reference, env);
+  if (!tx || tx.status !== 'success') {
     return err('Payment not verified', 400, request, env);
   }
 
-  // Find order
-  const { data: order } = await db.from('orders')
-    .select('id, order_ref, status, total_ngn')
-    .eq('paystack_ref', reference)
-    .single();
+  const order = await findOrderForTx(db, tx);
+  if (!order) return err('Payment received but no matching order was found. Contact support with your reference.', 404, request, env);
+
+  let settled: string;
+  try {
+    settled = await settlePaystackPayment(db, order, tx, env);
+  } catch (e: any) {
+    console.error('Verify fulfilment failed:', e?.message);
+    return err('Payment received but the order could not be updated. Contact support with your reference.', 500, request, env);
+  }
+  if (settled === 'mismatch') {
+    return err('Payment amount does not match the order. Contact support with your reference.', 409, request, env);
+  }
 
   return ok({
     verified: true,
-    order_ref: order?.order_ref,
-    status: order?.status,
-    amount_ngn: data.data.amount / 100,
+    order_ref: order.order_ref,
+    status: 'paid',
+    amount_ngn: tx.amount / 100,
   }, request, env);
 }
 
@@ -1240,7 +1356,7 @@ async function handleAdminGetOrders(
     .range(offset, offset + limit - 1);
 
   if (status) query = query.eq('status', status);
-  if (q) query = query.or(`order_ref.ilike.%${q}%,customer_email.ilike.%${q}%,customer_name.ilike.%${q}%`);
+  if (q) query = query.or(`order_ref.ilike.%${orSafe(q)}%,customer_email.ilike.%${orSafe(q)}%,customer_name.ilike.%${orSafe(q)}%`);
 
   const { data, error: dbErr, count } = await query;
   if (dbErr) return err(dbErr.message, 500, request, env);
@@ -1257,6 +1373,9 @@ async function handleAdminGetOrders(
 async function handleAdminGetOrder(
   db: SupabaseClient, ref: string, request: Request, env: Env,
 ): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
   const { data, error } = await db.from('orders')
     .select('*, order_items(*)')
     .eq('order_ref', ref)
@@ -1296,12 +1415,13 @@ async function handleAdminCreateOrder(
     if (!product) return err(`Product not found: ${item.product_id}`, 400, request, env);
 
     // Admin can override price — if override provided, use it; else resolve from DB
-    const priceField = getPriceField(item.billing_period || 'Quarterly');
-    const unitPrice = item.unit_price_ngn != null
-      ? Number(item.unit_price_ngn)
-      : (product[priceField] ?? 0);
+    const period = PERIOD_INFO[item.billing_period] || PERIOD_INFO['Quarterly'];
+    const override = Number(item.unit_price_ngn);
+    const unitPrice = item.unit_price_ngn != null && Number.isFinite(override) && override >= 0
+      ? override
+      : (product[period.field] ?? 0);
 
-    const qty = Math.max(1, parseInt(item.quantity) || 1);
+    const qty = Math.min(MAX_LINE_QTY, Math.max(1, parseInt(item.quantity) || 1));
     const lineTotal = unitPrice * qty;
     subtotalNGN += lineTotal;
 
@@ -1309,19 +1429,28 @@ async function handleAdminCreateOrder(
       product_id: product.id,
       product_name: product.name,
       category: product.category,
-      billing_period: item.billing_period || 'Quarterly',
+      billing_period: period.name,
       billing_type: product.billing_type || 'subscription',
-      duration_months: item.duration_months || 3,
+      duration_months: Number(item.duration_months) > 0 ? Number(item.duration_months) : period.months,
       unit_price_ngn: unitPrice,
       quantity: qty,
       total_price_ngn: lineTotal,
     });
   }
 
-  const discountNGN  = Number(body.discount_ngn)  || 0;
-  const taxNGN       = Number(body.tax_ngn)        || 0;
+  const discountNGN  = Math.min(subtotalNGN, Math.max(0, Number(body.discount_ngn) || 0));
+  const taxNGN       = Math.max(0, Number(body.tax_ngn) || 0);
   const totalNGN     = Math.max(0, subtotalNGN - discountNGN + taxNGN);
-  const orderStatus  = status || 'pending_manual';
+  // 'paid' goes through fulfillOrder below, so it gets the same usage,
+  // commission and receipt email as every other paid order.
+  const orderStatus  = status === 'paid' ? 'paid' : 'pending_manual';
+
+  // payment_method is a Postgres enum. Methods outside it (POS, coupon,
+  // cashback…) are kept in the notes instead of failing the insert.
+  const methodIsEnum = MANUAL_PAYMENT_METHODS.includes(payment_method);
+  const storedMethod = methodIsEnum ? payment_method : null;
+  const methodNote   = !methodIsEnum && payment_method ? `Paid via ${payment_method}` : null;
+  const storedNotes  = [methodNote, notes].filter(Boolean).join('\n') || null;
 
   // Find or create customer
   const customerId = await findOrCreateCustomer(db, {
@@ -1332,7 +1461,8 @@ async function handleAdminCreateOrder(
   });
 
   // Generate order ref
-  const { data: refData } = await db.rpc('generate_order_ref');
+  const { data: refData, error: refErr } = await db.rpc('generate_order_ref');
+  if (refErr || !refData) return err('Could not generate an order reference', 500, request, env);
   const orderRef = refData as string;
 
   // Insert order
@@ -1340,10 +1470,10 @@ async function handleAdminCreateOrder(
     order_ref:      orderRef,
     customer_id:    customerId,
     customer_name:  customer_name  || null,
-    customer_email: customer_email,
+    customer_email: String(customer_email).trim().toLowerCase(),
     customer_phone: customer_phone || null,
-    status:         orderStatus,
-    payment_method: payment_method || 'manual',
+    status:         'pending_manual',
+    payment_method: storedMethod,
     subtotal_ngn:   subtotalNGN,
     discount_ngn:   discountNGN,
     discount_code:  body.discount_code || null,
@@ -1352,20 +1482,32 @@ async function handleAdminCreateOrder(
     currency:       currency || 'NGN',
     fx_rate:        1,
     display_total:  totalNGN,
-    notes:          notes || null,
+    notes:          storedNotes,
   }).select().single();
 
   if (oErr || !order) return err('Failed to create order: ' + (oErr?.message || 'unknown'), 500, request, env);
 
   // Insert order items
   const orderItemRows = resolvedItems.map(i => ({ ...i, order_id: order.id }));
-  await db.from('order_items').insert(orderItemRows);
+  const { error: iErr } = await db.from('order_items').insert(orderItemRows);
+  if (iErr) {
+    await db.from('orders').delete().eq('id', order.id);
+    return err('Failed to save order items: ' + iErr.message, 500, request, env);
+  }
 
   await logEvent(db, 'order', order.id, 'created_manual', auth.userId, {
     order_ref: orderRef,
     total_ngn: totalNGN,
     item_count: resolvedItems.length,
   });
+
+  if (orderStatus === 'paid') {
+    try {
+      await fulfillOrder(db, order.id, storedMethod, env, ['pending_manual']);
+    } catch (e: any) {
+      return err(`Order ${orderRef} created but could not be marked paid: ${e?.message}`, 500, request, env);
+    }
+  }
 
   return ok({ order_id: order.id, order_ref: orderRef, total_ngn: totalNGN, status: orderStatus }, request, env);
 }
@@ -1377,12 +1519,16 @@ async function handleAdminCreateOrder(
 async function handleSearchCustomers(
   db: SupabaseClient, url: URL, request: Request, env: Env,
 ): Promise<Response> {
+  // Customer PII: staff only (same data as /v2/admin/customers/search).
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+
   const q = url.searchParams.get('q') || '';
   if (q.length < 2) return ok([], request, env);
 
   const { data, error } = await db.from('customers')
     .select('*')
-    .or(`name.ilike.%${q}%,email.ilike.%${q}%,phone.ilike.%${q}%`)
+    .or(`name.ilike.%${orSafe(q)}%,email.ilike.%${orSafe(q)}%,phone.ilike.%${orSafe(q)}%`)
     .limit(10);
 
   if (error) return err(error.message, 500, request, env);
@@ -1393,18 +1539,30 @@ async function handleSearchCustomers(
 // ============================================================
 // FULFILLMENT PIPELINE
 // ============================================================
+// Idempotent: the status update is conditional, and only the caller that wins
+// it runs the side effects (discount usage, commission, email). A second
+// webhook, a verify call racing the webhook, or a double-clicked approve all
+// return false and do nothing. Throws if the order can't be marked paid, so
+// callers can report failure (and Paystack can retry).
 async function fulfillOrder(
   db: SupabaseClient,
   orderId: string,
-  paymentMethod: string,
+  paymentMethod: string | null, // null: keep the order's current payment_method
   env: Env,
-): Promise<void> {
-  // 1. Update order status to paid
-  await db.from('orders').update({
+  allowedFrom: string[] = ['pending', 'pending_manual', 'rejected_pending', 'cancelled', 'failed'],
+): Promise<boolean> {
+  // 1. Claim the transition to paid
+  const { data: claimed, error: claimErr } = await db.from('orders').update({
     status: 'paid',
-    payment_method: paymentMethod as any,
+    ...(paymentMethod ? { payment_method: paymentMethod } : {}),
     paid_at: new Date().toISOString(),
-  }).eq('id', orderId);
+  })
+    .eq('id', orderId)
+    .in('status', allowedFrom)
+    .select('id');
+
+  if (claimErr) throw new Error(`Could not mark order ${orderId} paid: ${claimErr.message}`);
+  if (!claimed?.length) return false; // already paid, or not in a payable state
 
   // 2. Fetch full order with items
   const { data: order } = await db.from('orders')
@@ -1412,36 +1570,38 @@ async function fulfillOrder(
     .eq('id', orderId)
     .single();
 
-  if (!order) return;
+  if (!order) return true;
 
   console.log('Fulfillment started:', orderId);
-  
-  // 3. Increment discount usage
+
+  // 3. Discount usage. discount_usages is unique on (discount_id, customer_id);
+  //    only count the use when that row is new.
   if (order.discount_code) {
     const { data: disc } = await db.from('discount_codes')
-      .select('id').eq('code', order.discount_code).single();
+      .select('id').eq('code', order.discount_code).maybeSingle();
     if (disc) {
-      await db.rpc('increment_discount_usage', { p_discount_id: disc.id });
+      let firstUse = true;
       if (order.customer_id) {
-        try {
-          await db.from('discount_usages').insert({
-            discount_id: disc.id,
-            order_id: order.id,
-            customer_id: order.customer_id,
-          });
-        } catch {} // ignore if already exists (unique constraint)
+        const { error: usageErr } = await db.from('discount_usages').insert({
+          discount_id: disc.id,
+          order_id: order.id,
+          customer_id: order.customer_id,
+        });
+        if (usageErr) firstUse = false;
       }
+      if (firstUse) await db.rpc('increment_discount_usage', { p_discount_id: disc.id });
     }
   }
 
-  // 4. Affiliate commission
+  // 4. Affiliate commission, on what the goods sold for after discount
+  //    (wallet credit spent on the order still counts as a sale).
   if (order.affiliate_id) {
     const { data: aff } = await db.from('affiliates')
-      .select('commission_rate, user_id')
+      .select('commission_rate, user_id, status')
       .eq('id', order.affiliate_id)
       .single();
 
-    if (aff) {
+    if (aff && aff.status === 'approved') {
       // Self-referral check: affiliate's user_id ≠ customer's user_id
       let isSelfReferral = false;
       if (order.customer_id && aff.user_id) {
@@ -1451,13 +1611,16 @@ async function fulfillOrder(
       }
 
       if (!isSelfReferral) {
-        const commissionAmount = order.total_ngn * (aff.commission_rate / 100);
-        await db.from('affiliate_commissions').insert({
+        const base = Math.max(0, Number(order.subtotal_ngn) - Number(order.discount_ngn || 0));
+        const commissionAmount = base * (Number(aff.commission_rate) / 100);
+        // One commission per order (unique index on order_id); a duplicate insert just fails.
+        const { error: commErr } = await db.from('affiliate_commissions').insert({
           affiliate_id: order.affiliate_id,
           order_id: order.id,
           amount_ngn: Math.round(commissionAmount * 100) / 100,
           status: 'pending',
         });
+        if (commErr) console.error('Commission insert failed:', commErr.message);
       }
     }
   }
@@ -1475,6 +1638,8 @@ async function fulfillOrder(
     payment_method: paymentMethod,
     total_ngn: order.total_ngn,
   });
+
+  return true;
 }
 
 
@@ -1740,41 +1905,63 @@ async function sendPartnerSignupEmail(
 // HELPERS
 // ============================================================
 
+// Billing period → price column and duration. Public orders reject anything
+// not in this table; months are derived here, never taken from the client.
+const PERIOD_INFO: Record<string, { field: string; months: number | null; name: string }> = {
+  'Quarterly': { field: 'price_3m', months: 3,    name: 'Quarterly' },
+  'Biannual':  { field: 'price_6m', months: 6,    name: 'Biannual' },
+  'Annual':    { field: 'price_1y', months: 12,   name: 'Annual' },
+  'One-time':  { field: 'price_1m', months: null, name: 'One-time' }, // one-time products store same price in all fields
+  'quarterly': { field: 'price_3m', months: 3,    name: 'Quarterly' },
+  'biannual':  { field: 'price_6m', months: 6,    name: 'Biannual' },
+  'annual':    { field: 'price_1y', months: 12,   name: 'Annual' },
+  'one_time':  { field: 'price_1m', months: null, name: 'One-time' },
+};
+
 function getPriceField(billingPeriod: string): string {
-  const map: Record<string, string> = {
-    'Quarterly': 'price_3m',
-    'Biannual': 'price_6m',
-    'Annual': 'price_1y',
-    'One-time': 'price_1m', // one-time products store same price in all fields
-    'quarterly': 'price_3m',
-    'biannual': 'price_6m',
-    'annual': 'price_1y',
-    'one_time': 'price_1m',
-  };
-  return map[billingPeriod] || 'price_3m';
+  return PERIOD_INFO[billingPeriod]?.field || 'price_3m';
+}
+
+// Escape LIKE wildcards so a value can be used for an exact, case-insensitive ilike.
+function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, c => '\\' + c);
+}
+
+// Search text going into a PostgREST .or() filter: strip the characters that
+// delimit filters (commas, parentheses, quotes) and the * wildcard, so input
+// can't add conditions of its own.
+function orSafe(q: string): string {
+  return escapeLike(q.replace(/[,()"*]/g, ' ').trim()).slice(0, 100);
 }
 
 async function findOrCreateCustomer(
   db: SupabaseClient,
   info: { email: string; name?: string; phone?: string; source?: string },
 ): Promise<string | null> {
-  // Try to find existing customer by email
-  const { data: existingRows } = await db.from('customers')
-    .select('id')
-    .eq('email', info.email)
-    .limit(1);
+  // customers has a unique index on lower(email), so look up and insert case-insensitively.
+  const email = info.email.trim().toLowerCase();
+  const findExisting = async () => {
+    const { data } = await db.from('customers')
+      .select('id')
+      .ilike('email', escapeLike(email))
+      .limit(1);
+    return data?.[0]?.id ?? null;
+  };
 
-  if (existingRows && existingRows.length > 0) return existingRows[0].id;
+  const existing = await findExisting();
+  if (existing) return existing;
 
-  // Create new customer
   const { data: created, error } = await db.from('customers').insert({
-    name: info.name || info.email.split('@')[0],
-    email: info.email,
+    name: info.name || email.split('@')[0],
+    email,
     phone: info.phone || null,
     source: info.source || 'website',
   }).select('id').single();
 
   if (error || !created) {
+    // Lost a race with a concurrent insert for the same email.
+    const raced = await findExisting();
+    if (raced) return raced;
     console.error('Failed to create customer:', error?.message);
     return null;
   }
@@ -1799,7 +1986,10 @@ async function verifyPaystackSignature(
   const hex = Array.from(new Uint8Array(sig))
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
-  return hex === signature;
+  if (hex.length !== signature.length) return false;
+  let diff = 0;
+  for (let i = 0; i < hex.length; i++) diff |= hex.charCodeAt(i) ^ signature.charCodeAt(i);
+  return diff === 0;
 }
 
 async function logEvent(
@@ -1825,6 +2015,8 @@ async function logEvent(
 // PHASE 3 HANDLER FUNCTIONS
 // ════════════════════════════════════════════════════════════════
 
+const STAFF_ROLES = ['admin', 'super_admin', 'support_agent'];
+
 async function requireAdmin(
   db: SupabaseClient, request: Request, env: Env
 ): Promise<{ ok: true; userId: string } | { ok: false; response: Response }> {
@@ -1840,7 +2032,7 @@ async function requireAdmin(
     .eq('id', user.id)
     .single();
 
-  if (!profile || !['admin', 'super_admin', 'support_agent'].includes(profile.role)) {
+  if (!profile || !STAFF_ROLES.includes(profile.role)) {
     return { ok: false, response: err('Forbidden — admin access required', 403, request, env) };
   }
 
@@ -1876,7 +2068,7 @@ async function handleAdminCustomers(
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
 
-  if (q) query = query.or(`name.ilike.%${q}%,email.ilike.%${q}%,phone.ilike.%${q}%`);
+  if (q) query = query.or(`name.ilike.%${orSafe(q)}%,email.ilike.%${orSafe(q)}%,phone.ilike.%${orSafe(q)}%`);
 
   const { data, error: dbErr, count } = await query;
   if (dbErr) return err(dbErr.message, 500, request, env);
@@ -1898,7 +2090,7 @@ async function handleAdminCustomerSearch(
   const { data, error: dbErr } = await db
     .from('customers')
     .select('id, name, email, phone, category')
-    .or(`name.ilike.%${q}%,email.ilike.%${q}%,phone.ilike.%${q}%`)
+    .or(`name.ilike.%${orSafe(q)}%,email.ilike.%${orSafe(q)}%,phone.ilike.%${orSafe(q)}%`)
     .limit(10);
 
   if (dbErr) return err(dbErr.message, 500, request, env);
@@ -1934,7 +2126,7 @@ async function handleAdminProducts(
     .range(offset, offset + limit - 1);
 
   if (status) query = query.eq('status', status);
-  if (q) query = query.or(`name.ilike.%${q}%,category.ilike.%${q}%,tags.ilike.%${q}%`);
+  if (q) query = query.or(`name.ilike.%${orSafe(q)}%,category.ilike.%${orSafe(q)}%,tags.ilike.%${orSafe(q)}%`);
 
   const { data, error: dbErr, count } = await query;
   if (dbErr) return err(dbErr.message, 500, request, env);
@@ -1974,6 +2166,8 @@ async function handleAdminUpdateProduct(
   return ok(data, request, env);
 }
 
+const MANUAL_PAYMENT_METHODS = ['whatsapp', 'bank_transfer', 'cash', 'wallet', 'free', 'paystack'];
+
 async function handleAdminApproveOrderV2(
   db: SupabaseClient, ref: string, request: Request, env: Env
 ): Promise<Response> {
@@ -1981,65 +2175,38 @@ async function handleAdminApproveOrderV2(
   if (!auth.ok) return auth.response;
 
   const body = await request.json().catch(() => ({})) as any;
-  const paymentMethod = 'whatsapp';
 
   const { data: order, error: findErr } = await db
     .from('orders')
-    .select('id, status, order_ref, total_ngn, discount_code')
+    .select('id, status, order_ref, payment_method')
     .eq('order_ref', ref)
     .single();
 
   if (findErr || !order) return err('Order not found', 404, request, env);
   if (order.status !== 'pending_manual') return err(`Cannot approve — status is "${order.status}"`, 400, request, env);
 
-  // Use fulfillOrder pipeline
-  // 🔴 force update BEFORE fulfill (guarantees persistence)
-  await db.from('orders').update({
-    status: 'paid',
-    payment_method: paymentMethod,
-    paid_at: new Date().toISOString(),
-  }).eq('id', order.id);
+  // Keep how the order was actually paid (cash, bank transfer…) unless the
+  // admin says otherwise. This used to overwrite every order with 'whatsapp'.
+  const paymentMethod = MANUAL_PAYMENT_METHODS.includes(body?.payment_method)
+    ? body.payment_method
+    : (order.payment_method || 'whatsapp');
 
-  // then run rest of pipeline
-  // 🔍 STEP A — force update + log result
-const { data: updated, error: updateErr } = await db
-.from('orders')
-.update({
-  status: 'paid',
-  payment_method: paymentMethod,
-  paid_at: new Date().toISOString(),
-})
-.eq('id', order.id)
-.select()
-.single();
-
-console.log('UPDATE RESULT:', updated, updateErr);
-
-// 🔴 STOP if update failed
-if (updateErr || !updated) {
-return err('Failed to update order status', 500, request, env);
-}
-
-// 🔍 STEP B — re-fetch immediately
-const { data: check } = await db
-.from('orders')
-.select('status')
-.eq('id', order.id)
-.single();
-
-console.log('AFTER UPDATE STATUS:', check?.status);
-
-// continue pipeline
-await fulfillOrder(db, order.id, paymentMethod, env);
+  // Conditional on pending_manual inside fulfillOrder, so a double-click or two
+  // admins approving at once fulfils (commission, usage, email) only once.
+  let transitioned: boolean;
+  try {
+    transitioned = await fulfillOrder(db, order.id, paymentMethod, env, ['pending_manual']);
+  } catch (e: any) {
+    return err(e?.message || 'Failed to update order status', 500, request, env);
+  }
+  if (!transitioned) return err('Order was already approved or changed by someone else', 409, request, env);
 
   await logEvent(db, 'order', order.id, 'approved_manual_v2', auth.userId, {
     order_ref: order.order_ref,
     payment_method: paymentMethod,
   });
 
-  console.log('Approving order:', ref);
-
-  return ok({ approved: true, order_ref: ref }, request, env);
+  return ok({ approved: true, order_ref: ref, status: 'paid' }, request, env);
 }
 
 async function handleAdminRejectOrder(
@@ -2049,42 +2216,55 @@ async function handleAdminRejectOrder(
   if (!auth.ok) return auth.response;
 
   const body = await request.json().catch(() => ({})) as any;
-  const reason = body.reason || '';
+  const reason = String(body.reason || '').trim();
   const confirmReject = body.confirm === true; // second-stage confirmation
 
   const { data: order, error: findErr } = await db
     .from('orders')
-    .select('id, status, order_ref, notes')
+    .select('id, status, order_ref, notes, wallet_ngn, customer_id')
     .eq('order_ref', ref)
     .single();
 
   if (findErr || !order) return err('Order not found', 404, request, env);
 
+  const withReason = (notes: string | null) =>
+    reason ? [notes, `Rejection reason: ${reason}`].filter(Boolean).join('\n') : notes;
+
   if (confirmReject && order.status === 'rejected_pending') {
     // Final rejection — move to cancelled
-    await db.from('orders').update({
+    const { data: moved } = await db.from('orders').update({
       status: 'cancelled',
-      notes: reason || order.notes,
+      notes: withReason(order.notes),
       updated_at: new Date().toISOString(),
-    }).eq('id', order.id);
+    }).eq('id', order.id).eq('status', 'rejected_pending').select('id');
+    if (!moved?.length) return err('Order changed while rejecting — reload and try again', 409, request, env);
+
+    // Give back any wallet balance this order had already taken.
+    if (Number(order.wallet_ngn) > 0) {
+      await refundWalletForOrder(db, order, Number(order.wallet_ngn), 'cancelled');
+    }
 
     await logEvent(db, 'order', order.id, 'rejected_confirmed', auth.userId, {
       order_ref: order.order_ref, reason,
     });
 
-    return ok({ rejected: true, confirmed: true, order_ref: ref }, request, env);
+    return ok({ rejected: true, confirmed: true, status: 'cancelled', order_ref: ref }, request, env);
   }
 
   if (['pending', 'pending_manual'].includes(order.status)) {
-    // First-stage rejection — move to rejected_pending
-    await db.from('orders').update({
+    // First-stage rejection — move to rejected_pending. The previous status and
+    // notes go in the event log so undo-reject can put them back exactly.
+    const { data: moved } = await db.from('orders').update({
       status: 'rejected_pending',
-      notes: reason,
+      notes: withReason(order.notes),
       updated_at: new Date().toISOString(),
-    }).eq('id', order.id);
+    }).eq('id', order.id).eq('status', order.status).select('id');
+    if (!moved?.length) return err('Order changed while rejecting — reload and try again', 409, request, env);
 
     await logEvent(db, 'order', order.id, 'rejected_pending', auth.userId, {
       order_ref: order.order_ref, reason,
+      prev_status: order.status,
+      prev_notes: order.notes,
     });
 
     return ok({ rejected: true, confirmed: false, status: 'rejected_pending', order_ref: ref }, request, env);
@@ -2271,20 +2451,39 @@ async function handleAdminApprovePartner(
       .maybeSingle();
  
     if (!existing) {
-      // Generate a unique short referral code from the store name
+      // Referral codes are stored UPPER-case: every lookup (resolve, click,
+      // order) upper-cases the incoming code before an exact match.
       const base = String(app.store_name || app.owner_name || 'partner')
-        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 16);
-      const suffix = Math.random().toString(36).slice(2, 6);
-      const referralCode = `${base}-${suffix}`;
- 
-      await db.from('affiliates').insert({
-        user_id: app.user_id,
-        partner_application_id: app.id,
-        referral_code: referralCode,
-        status: 'approved',
-        display_name: app.store_name || app.owner_name,
-        email: app.owner_email,
-      });
+        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 16) || 'partner';
+
+      let created = false;
+      let lastError = '';
+      for (let attempt = 0; attempt < 5 && !created; attempt++) {
+        const suffix = Math.random().toString(36).slice(2, 6);
+        const { error: affErr } = await db.from('affiliates').insert({
+          user_id: app.user_id,
+          referral_code: `${base}-${suffix}`.toUpperCase(),
+          status: 'approved',
+          store_name: app.store_name || app.owner_name,
+          business_name: app.legal_name,
+          bank_name: app.bank_name,
+          account_name: app.account_name,
+          account_number: app.account_number,
+          application_data: { partner_application_id: app.id },
+        });
+        if (!affErr) created = true;
+        else if (affErr.code === '23505') lastError = affErr.message; // code collision: retry
+        else { lastError = affErr.message; break; }
+      }
+
+      if (!created) {
+        // Put the application back so approval can be retried, instead of
+        // leaving an 'approved' partner with no referral code.
+        await db.from('partner_applications').update({
+          status: 'pending_review', reviewed_by: null, reviewed_at: null,
+        }).eq('id', app.id);
+        return err('Could not create the affiliate account: ' + lastError, 500, request, env);
+      }
     }
  
     // Promote the auth user's role to 'partner'
@@ -2350,10 +2549,11 @@ async function handlePartnerMe(
   if (app.status === 'approved') {
     const { data: aff } = await db
       .from('affiliates')
-      .select('id, referral_code, status, display_name')
+      .select('id, referral_code, status, store_name, business_name')
       .eq('user_id', user.id)
       .maybeSingle();
-    affiliate = aff;
+    // display_name is what the partner dashboard reads; there is no such column.
+    affiliate = aff ? { ...aff, display_name: aff.store_name || aff.business_name } : null;
   }
  
   return ok({ profile: app, affiliate }, request, env);
@@ -2478,6 +2678,7 @@ async function handleValidateDiscountV2(
     ? subtotalNGN * (discount.value / 100)
     : discount.value;
   if (discount.max_discount_ngn) amountNGN = Math.min(amountNGN, discount.max_discount_ngn);
+  amountNGN = Math.max(0, Math.min(amountNGN, subtotalNGN || 0));
 
   const display = discount.type === 'percentage'
     ? `${discount.value}% off${discount.max_discount_ngn ? ` (max ₦${Number(discount.max_discount_ngn).toLocaleString()})` : ''}`
@@ -2686,14 +2887,21 @@ async function handleAdminApproveAffiliate(
   if (!auth.ok) return auth.response;
  
   const body = await request.json().catch(() => ({})) as any;
- 
+
+  // Only change the rate when one is given; re-approving a suspended affiliate
+  // used to reset a custom rate to 5%, and made 0% impossible.
+  const updates: Record<string, any> = { status: 'approved', updated_at: new Date().toISOString() };
+  if (body.commission_rate !== undefined && body.commission_rate !== null && body.commission_rate !== '') {
+    const rate = Number(body.commission_rate);
+    if (!Number.isFinite(rate) || rate < 0 || rate > 100) {
+      return err('commission_rate must be between 0 and 100', 400, request, env);
+    }
+    updates.commission_rate = rate;
+  }
+
   const { data, error: dbErr } = await db
     .from('affiliates')
-    .update({
-      status: 'approved',
-      commission_rate: body.commission_rate || 5.00,
-      updated_at: new Date().toISOString(),
-    })
+    .update(updates)
     .eq('id', id)
     .select()
     .single();
@@ -2801,7 +3009,7 @@ async function handleAdminGetLinks(
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
 
-  if (q) query = query.or(`slug.ilike.%${q}%,destination_url.ilike.%${q}%,tags.ilike.%${q}%`);
+  if (q) query = query.or(`slug.ilike.%${orSafe(q)}%,destination_url.ilike.%${orSafe(q)}%,tags.ilike.%${orSafe(q)}%`);
 
   const { data, error: dbErr, count } = await query;
   if (dbErr) return err(dbErr.message, 500, request, env);
@@ -2888,6 +3096,17 @@ async function handleAdminUpdateLink(
   const updates: Record<string, any> = {};
   for (const key of LINK_WRITE_FIELDS) {
     if (body[key] !== undefined) updates[key] = body[key];
+  }
+
+  // Same normalisation as create: the shortener matches slugs exactly.
+  if (updates.slug !== undefined) {
+    const slug = String(updates.slug || '').trim().toLowerCase();
+    if (!slug) delete updates.slug;
+    else {
+      const { data: taken } = await db.from('short_links').select('id').eq('slug', slug).neq('id', id).limit(1);
+      if (taken?.length) return err(`Slug "${slug}" is already taken`, 409, request, env);
+      updates.slug = slug;
+    }
   }
 
   // Password handling:
@@ -3101,19 +3320,24 @@ async function handleAdImpression(
   db: SupabaseClient, request: Request, env: Env
 ): Promise<Response> {
   const body = await request.json().catch(() => ({})) as any;
-  const adIds = body.ad_ids as string[];
-  if (!adIds || !Array.isArray(adIds) || adIds.length === 0) {
+  if (!Array.isArray(body.ad_ids) || body.ad_ids.length === 0) {
     return err('ad_ids array required', 400, request, env);
   }
- 
-  // Increment view_count for each ad
-  for (const adId of adIds) {
-    const { data: ad } = await db.from('ads').select('view_count').eq('id', adId).single();
-    if (ad) {
-      await db.from('ads').update({ view_count: (ad.view_count || 0) + 1 }).eq('id', adId);
+  // Public endpoint: bound the work one request can cause.
+  const adIds = [...new Set((body.ad_ids as unknown[]).filter((x): x is string => typeof x === 'string'))].slice(0, 20);
+
+  // Atomic increment (increment_ad_views); fall back to per-ad read/write if
+  // that RPC hasn't been applied yet.
+  const { error: rpcErr } = await db.rpc('increment_ad_views', { p_ad_ids: adIds });
+  if (rpcErr) {
+    for (const adId of adIds) {
+      const { data: ad } = await db.from('ads').select('view_count').eq('id', adId).maybeSingle();
+      if (ad) {
+        await db.from('ads').update({ view_count: (ad.view_count || 0) + 1 }).eq('id', adId);
+      }
     }
   }
- 
+
   return ok({ tracked: true, count: adIds.length }, request, env);
 }
  
@@ -3242,17 +3466,34 @@ async function handleAdminUndoReject(
     return err(`Cannot undo — status is "${order.status}"`, 400, request, env);
   }
 
-  await db.from('orders').update({
-    status: 'pending_manual',
-    notes: null,
+  // Restore what the first-stage reject recorded. Older rejections predate
+  // that log metadata; fall back to pending_manual and leave notes alone.
+  const { data: lastReject } = await db
+    .from('event_logs')
+    .select('metadata')
+    .eq('entity', 'order')
+    .eq('entity_id', order.id)
+    .eq('action', 'rejected_pending')
+    .order('created_at', { ascending: false })
+    .limit(1);
+  const meta = lastReject?.[0]?.metadata || {};
+  const prevStatus = ['pending', 'pending_manual'].includes(meta.prev_status) ? meta.prev_status : 'pending_manual';
+
+  const restore: Record<string, any> = {
+    status: prevStatus,
     updated_at: new Date().toISOString(),
-  }).eq('id', order.id);
+  };
+  if ('prev_notes' in meta) restore.notes = meta.prev_notes;
+
+  const { data: moved } = await db.from('orders').update(restore)
+    .eq('id', order.id).eq('status', 'rejected_pending').select('id');
+  if (!moved?.length) return err('Order changed while undoing — reload and try again', 409, request, env);
 
   await logEvent(db, 'order', order.id, 'rejection_undone', auth.userId, {
     order_ref: order.order_ref,
   });
 
-  return ok({ undone: true, order_ref: ref }, request, env);
+  return ok({ undone: true, order_ref: ref, status: prevStatus }, request, env);
 }
 
 
@@ -3286,6 +3527,7 @@ async function handleAdminCreateProduct(
     'name', 'slug', 'status', 'stock_status', 'price_1m', 'price_3m', 'price_6m', 'price_1y',
     'category', 'tags', 'short_description', 'description', 'category_tagline',
     'domain', 'billing_type', 'billing_period', 'featured', 'sort_order', 'image_url',
+    'whatsapp_group_url', 'social_links',
   ];
   const insert: Record<string, any> = {};
   for (const key of allowed) {
@@ -3322,13 +3564,18 @@ async function handleAdminGetDiscounts(
   const auth = await requireAdmin(db, request, env);
   if (!auth.ok) return auth.response;
 
-  const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit') || '100')));
+  const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit') || '100') || 100));
+  // ?code= looks up one code exactly (the admin New Order form uses it).
+  const code = url.searchParams.get('code')?.trim().toUpperCase();
 
-  const { data, error: dbErr } = await db
+  let query = db
     .from('discount_codes')
     .select('*')
     .order('created_at', { ascending: false })
     .limit(limit);
+  if (code) query = query.eq('code', code);
+
+  const { data, error: dbErr } = await query;
 
   if (dbErr) return err(dbErr.message, 500, request, env);
   return ok(data, request, env);
@@ -3497,7 +3744,12 @@ async function handleAdminDeleteDiscount(
   return ok({ deleted: true, id: discountId }, request, env);
 }
 
+const SETTINGS_WRITE_FIELDS = ['facebook', 'instagram', 'phone', 'receipt_caption', 'tiktok', 'x']
+
 async function handleGetSettings(db: any, request: Request, env: any) {
+  const auth = await requireAdmin(db, request, env)
+  if (!auth.ok) return auth.response
+
   const { data, error } = await db.from('settings').select('*').single()
 
   if (error) return err(error.message, 500, request, env)
@@ -3506,18 +3758,26 @@ async function handleGetSettings(db: any, request: Request, env: any) {
 }
 
 async function handleUpdateSettings(db: any, request: Request, env: any) {
-  const body: unknown = await request.json()
+  const auth = await requireAdmin(db, request, env)
+  if (!auth.ok) return auth.response
+
+  const body: unknown = await request.json().catch(() => null)
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return err('Invalid request body', 400, request, env)
   }
 
+  const updates: Record<string, unknown> = {}
+  for (const key of SETTINGS_WRITE_FIELDS) {
+    if ((body as any)[key] !== undefined) updates[key] = (body as any)[key]
+  }
+  if (Object.keys(updates).length === 0) return err('No updatable fields provided', 400, request, env)
+  updates.updated_at = new Date().toISOString()
+
+  // settings is a single row keyed by id = true.
   const { data, error } = await db
     .from('settings')
-    .update({
-      ...(body as Record<string, unknown>),
-      updated_at: new Date().toISOString()
-    })
-    .eq('id', 1)
+    .update(updates)
+    .eq('id', true)
     .select()
     .single()
 
@@ -3541,54 +3801,79 @@ async function requireAuth(
 }
  
 // ── POST /v2/auth/signup ─────────────────────────────────────────
+// Completes the profile for the signed-in user. Identity comes from the token,
+// never the body: this used to upsert any user_id from the body with
+// role 'customer', which could demote an admin or claim another email's
+// customer record. Idempotent — the web app calls it after sign-up and again
+// at login (for sign-ups that needed email confirmation first). Values in the
+// body overwrite; values from the sign-up metadata only fill empty fields.
 async function handleCustomerSignup(db: any, request: Request, env: any): Promise<Response> {
-  const body = await request.json().catch(() => null) as any
-  if (!body?.email) return err('Email is required', 400, request, env)
- 
-  const { user_id, full_name, email, phone, gender } = body
- 
-  // 1. Upsert profile row (id = Supabase auth UUID)
-  await db.from('profiles').upsert({
-    id:        user_id,
-    role:      'customer',
-    full_name: full_name || null,
-    email:     email,
-    phone:     phone || null,
-    gender:    gender || null,
-  }, { onConflict: 'id' })
- 
-  // 2. Create or link customers row
-  const emailLower = email.toLowerCase()
+  const token = (request.headers.get('Authorization') || '').replace('Bearer ', '').trim()
+  if (!token) return err('Unauthorized', 401, request, env)
+  const { data: userData, error: userErr } = await db.auth.getUser(token)
+  const user = userData?.user
+  if (userErr || !user) return err('Unauthorized', 401, request, env)
 
-  const { data: existing } = await db.from('customers')
-    .select('id, user_id')
-    .ilike('email', emailLower)
-    .limit(1)
+  const body = (await request.json().catch(() => null) as any) || {}
+  const meta = user.user_metadata || {}
+  const userId = user.id
+  const email = String(user.email || '').toLowerCase()
 
-  if (!existing?.length) {
-    await db.from('customers').insert({
-      user_id: user_id,
-      name:    full_name || email.split('@')[0],
-      email: emailLower,
-      phone:   phone || null,
-      source:  'customer_signup',
-      is_active: true,
-    })
+  const { data: profileRows } = await db.from('profiles')
+    .select('id, full_name, phone, gender, email').eq('id', userId).limit(1)
+  const profile = profileRows?.[0]
+
+  const pick = (field: 'full_name' | 'phone' | 'gender') => {
+    if (body[field]) return body[field]
+    if (!profile?.[field] && meta[field]) return meta[field]
+    return undefined
+  }
+  const fields: Record<string, any> = {}
+  for (const f of ['full_name', 'phone', 'gender'] as const) {
+    const v = pick(f)
+    if (v !== undefined) fields[f] = v
+  }
+  if (email && !profile?.email) fields.email = email
+
+  // 1. Profile. The auth trigger normally creates it (role 'user'); role is never set here.
+  if (profile) {
+    if (Object.keys(fields).length) await db.from('profiles').update(fields).eq('id', userId)
   } else {
-    // Link existing customer record to this auth user
-    await db
-    .from('customers')
-    .update({ user_id })
-    .ilike('email', emailLower)
-    .is('user_id', null)
+    await db.from('profiles').insert({ id: userId, role: 'customer', email, ...fields })
   }
- 
-  // 3. Create wallet if not exists
-  const { data: walletExists } = await db.from('wallets').select('id').eq('user_id', user_id).limit(1)
+
+  // 2. Customer row: already linked, else claim the guest row for this exact email, else create.
+  const { data: linked } = await db.from('customers').select('id').eq('user_id', userId).limit(1)
+  const customerPatch: Record<string, any> = {}
+  if (fields.full_name) customerPatch.name = fields.full_name
+  if (fields.phone) customerPatch.phone = fields.phone
+
+  if (linked?.length) {
+    if (Object.keys(customerPatch).length) await db.from('customers').update(customerPatch).eq('id', linked[0].id)
+  } else if (email) {
+    const { data: claimed } = await db.from('customers')
+      .update({ user_id: userId, ...customerPatch })
+      .ilike('email', escapeLike(email))
+      .is('user_id', null)
+      .select('id')
+    if (!claimed?.length) {
+      await db.from('customers').insert({
+        user_id: userId,
+        name: fields.full_name || email.split('@')[0],
+        email,
+        phone: fields.phone || null,
+        source: 'customer_signup',
+        is_active: true,
+      })
+    }
+  }
+
+  // 3. Wallet
+  const { data: walletExists } = await db.from('wallets').select('id').eq('user_id', userId).limit(1)
   if (!walletExists?.length) {
-    await db.from('wallets').insert({ user_id, balance_ngn: 0 })
+    await db.from('wallets').insert({ user_id: userId, balance_ngn: 0 })
   }
- 
+
   return ok({ success: true }, request, env)
 }
  
@@ -3650,7 +3935,8 @@ async function handleGetMyOrders(db: any, request: Request, env: any): Promise<R
         id, product_name, billing_period, quantity, unit_price_ngn, total_price_ngn
       )
     `)
-    .eq('customer_email', email)
+    // Case-insensitive: checkout emails were stored as typed before being lower-cased.
+    .ilike('customer_email', escapeLike(String(email).toLowerCase()))
     .order('created_at', { ascending: false })
     .limit(50)
  
@@ -3797,6 +4083,7 @@ async function handleAdminWalletTopup(db: any, request: Request, env: any): Prom
   let { data: wallet } = await db.from('wallets').select('*').eq('user_id', userId).limit(1)
   if (!wallet?.length) {
     const { data: newWallet } = await db.from('wallets').insert({ user_id: userId, balance_ngn: 0 }).select().single()
+    if (!newWallet) return err('Could not create wallet', 500, request, env)
     wallet = [newWallet]
   }
  
@@ -3880,7 +4167,9 @@ async function handleAdminToggleWallet(db: any, request: Request, env: any) {
   const auth = await requireAdmin(db, request, env)
   if (!auth.ok) return auth.response
 
-  const customerId = request.url.split('/')[4]
+  // /v2/admin/customers/:id/wallet/toggle — split the path, not the full URL
+  // (request.url.split('/')[4] was 'admin', so every toggle 404'd).
+  const customerId = new URL(request.url).pathname.split('/')[4]
 
   // 1. get user_id from customer
   const { data: customer } = await db
