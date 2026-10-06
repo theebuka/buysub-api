@@ -2,6 +2,8 @@
 # BUYSUB — Cloudflare Workers API Configuration
 # ============================================================
 name = "buysub-api-v2"
+# Pinned so a login to a different Cloudflare account can never deploy here.
+account_id = "e6fedf8d3c96d8e4d22e27d618f60ada"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
