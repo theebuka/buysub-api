@@ -1845,9 +1845,9 @@ function buildOrderEmailHtml(
    ══════════════════════════════════════════════════════════════════ */
  
 async function sendPartnerSignupEmail(
-  args: { to: string; ownerName: string; storeName: string },
+  args: { to: string; ownerName: string; storeName: string; verifyUrl: string | null },
   env: Env
-): Promise<void> {
+): Promise<Response> {
   const html = `<!DOCTYPE html>
 <html>
   <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Welcome to BuySub Partners</title></head>
@@ -1867,10 +1867,13 @@ async function sendPartnerSignupEmail(
               Our team will review your application within <strong style="color:#e8e8ec;">3–5 business days</strong> and get back to you via your preferred contact method.
             </p>
             <p style="margin:0 0 24px;color:#a0a0b0;font-size:14px;line-height:1.7;">
+              ${args.verifyUrl
+                ? 'First, confirm this is your email address. We can only review applications with a verified email, and you can\'t sign in until it\'s done.'
+                : 'Before you can sign in, verify your email: on the login page, try to sign in and choose “Resend verification email”.'}
               Once approved, you can log in to your partner dashboard to view affiliate stats, track earnings, and manage your profile.
             </p>
             <div style="text-align:center;margin:24px 0 8px;">
-              <a href="https://app.buysub.ng/login" style="display:inline-block;padding:14px 28px;border-radius:10px;background:#7C5CFF;color:#fff;font-size:14px;font-weight:600;text-decoration:none;box-shadow:0 6px 20px rgba(124,92,255,0.35);">Go to dashboard</a>
+              <a href="${escHtml(args.verifyUrl || 'https://app.buysub.ng/login')}" style="display:inline-block;padding:14px 28px;border-radius:10px;background:#7C5CFF;color:#fff;font-size:14px;font-weight:600;text-decoration:none;box-shadow:0 6px 20px rgba(124,92,255,0.35);">${args.verifyUrl ? 'Verify my email' : 'Go to login'}</a>
             </div>
           </td></tr>
           <tr><td style="padding:20px 32px 32px;border-top:1px solid #1c1c22;">
@@ -1885,7 +1888,7 @@ async function sendPartnerSignupEmail(
   </body>
 </html>`;
  
-  await fetch('https://api.resend.com/emails', {
+  return fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${env.RESEND_API_KEY}`,
@@ -2305,12 +2308,15 @@ async function handleSubmitPartnerApplication(
     return err('All compliance checkboxes must be accepted', 400, request, env);
   }
  
-  // Create Supabase auth user (email_confirm false so we don't need SMTP from here).
-  // If the email is already registered, return a helpful error.
+  // Create the auth user UNCONFIRMED. This used to pass email_confirm: true,
+  // so anyone could create a working account for an email they don't own.
+  // The applicant verifies through the link in the welcome email below; until
+  // then they can't sign in and an admin can't approve the application.
+  const ownerEmail = String(body.owner_email).trim().toLowerCase();
   const { data: signUp, error: signUpErr } = await db.auth.admin.createUser({
-    email: body.owner_email,
+    email: ownerEmail,
     password: body.password,
-    email_confirm: true,
+    email_confirm: false,
     user_metadata: {
       full_name: body.owner_name,
       role: 'partner_applicant',
@@ -2343,7 +2349,7 @@ async function handleSubmitPartnerApplication(
       registration_year: body.registration_year || null,
       social_media: body.social_media || null,
       owner_name: body.owner_name,
-      owner_email: body.owner_email,
+      owner_email: ownerEmail,
       owner_phone: body.owner_phone,
       gender: body.gender || null,
       owner_location: body.owner_location || null,
@@ -2375,19 +2381,36 @@ async function handleSubmitPartnerApplication(
     business_email: body.business_email,
   });
  
-  // Fire-and-forget welcome email (F4)
+  // Verification link, sent from our own domain via Resend. Verifying a magic
+  // link confirms the email and signs them in, landing on the partner dashboard.
+  let verifyUrl: string | null = null;
   try {
-    await sendPartnerSignupEmail({
-      to: body.owner_email,
+    const { data: link, error: linkErr } = await db.auth.admin.generateLink({
+      type: 'magiclink',
+      email: ownerEmail,
+      options: { redirectTo: `${env.FRONTEND_URL || 'https://app.buysub.ng'}/partners/dashboard` },
+    });
+    if (linkErr) console.error('partner verify link failed:', linkErr.message);
+    verifyUrl = link?.properties?.action_link ?? null;
+  } catch (e) {
+    console.error('partner verify link failed:', e);
+  }
+
+  let emailSent = false;
+  try {
+    const res = await sendPartnerSignupEmail({
+      to: ownerEmail,
       ownerName: body.owner_name,
       storeName: body.store_name,
+      verifyUrl,
     }, env);
+    emailSent = res.ok && !!verifyUrl;
   } catch (e) {
     console.error('partner welcome email failed:', e);
   }
  
   return jsonResponse(
-    { ok: true, data: { id: data.id, status: data.status, user_id: userId } },
+    { ok: true, data: { id: data.id, status: data.status, user_id: userId, verification_email_sent: emailSent } },
     201, request, env
   );
 }
@@ -2426,6 +2449,20 @@ async function handleAdminApprovePartner(
   if (!auth.ok) return auth.response;
  
   const body = await request.json().catch(() => ({})) as any;
+
+  // Only approve applicants who have proved they own the email: approval
+  // creates a referral code and payout details tied to this account.
+  const { data: pending } = await db
+    .from('partner_applications')
+    .select('user_id')
+    .eq('id', id)
+    .maybeSingle();
+  if (pending?.user_id) {
+    const { data: authUser } = await db.auth.admin.getUserById(pending.user_id);
+    if (!authUser?.user?.email_confirmed_at) {
+      return err('The applicant has not verified their email yet. Ask them to use the link in their welcome email, or "Resend verification email" on the login page.', 409, request, env);
+    }
+  }
  
   const { data: app, error: appErr } = await db
     .from('partner_applications')
