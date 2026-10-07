@@ -3091,7 +3091,7 @@ async function handleAdminAffiliates(
     .from('affiliates')
     .select(`
       *,
-      profiles!affiliates_user_id_fkey ( display_name, email )
+      profiles!affiliates_user_id_fkey ( display_name:full_name, email )
     `, { count: 'exact' })
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
