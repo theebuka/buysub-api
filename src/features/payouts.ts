@@ -1,10 +1,15 @@
 // ============================================================
-// BUYSUB — Partner payout requests and tiers (migration 15)
+// BUYSUB — Scheduled partner payouts and tiers (migration 15)
 // ============================================================
-// GET  /v2/partners/me/payouts       balance (available / on hold), open request, history
-// POST /v2/partners/me/payouts       request everything available (request_partner_payout)
-// GET  /v2/admin/payouts             ?status=&page=
-// POST /v2/admin/payouts/:id/settle  { action: 'paid' | 'rejected', note?, reference? }
+// Partners are paid on the schedule they chose (partner_applications.
+// payout_frequency). The daily cron calls runPartnerPayouts, which creates one
+// payout per partner per period through create_partner_payout. Commissions
+// younger than hold_days at the period end roll into the next period.
+//
+// GET  /v2/partners/me/payouts             next payout date and estimate, open payouts, history
+// GET  /v2/admin/payouts                   ?status=&page=
+// POST /v2/admin/payouts/:id/settle        { action: 'paid' | 'rejected', note?, reference? }
+// POST /v2/admin/jobs/partner-payouts      run the scheduler now (idempotent)
 //
 // Tiers: feature_flags.partner_tiers lists tiers by lifetime referred sales
 // (paid orders, after discount). When on, a new commission uses the higher of
@@ -74,8 +79,114 @@ function payoutTerms(flags: Flags) {
   return {
     enabled: isOn(flags, 'partner_payouts', false),
     min_ngn: Number(cfg(flags, 'partner_payouts', 'min_ngn', 5000)),
-    hold_days: Number(cfg(flags, 'partner_payouts', 'hold_days', 7)),
+    hold_days: Number(cfg(flags, 'partner_payouts', 'hold_days', 14)),
   };
+}
+
+// ── Payout periods ──────────────────────────────────────────
+// A period ends on the 1st of a month (Africa/Lagos, UTC+1, no DST) in which
+// the partner's frequency starts a new period. Dates are 'YYYY-MM-DD'.
+
+const PERIOD_MONTHS: Record<string, number[]> = {
+  monthly: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+  quarterly: [0, 3, 6, 9],
+  biannual: [0, 6],
+  annual: [0],
+};
+export const FREQUENCIES = ['Monthly', 'Quarterly', 'Biannual', 'Annual'] as const;
+
+export function normalFrequency(f: string | null | undefined): string {
+  const k = String(f || '').trim().toLowerCase();
+  return FREQUENCIES.find(x => x.toLowerCase() === k) ?? 'Monthly';
+}
+
+const LAGOS_OFFSET_MS = 3_600_000;
+const lagosToday = (at: Date) => {
+  const d = new Date(at.getTime() + LAGOS_OFFSET_MS);
+  return { y: d.getUTCFullYear(), m: d.getUTCMonth(), day: d.getUTCDate() };
+};
+const ymd = (y: number, m: number) => {
+  const d = new Date(Date.UTC(y, m, 1));
+  return d.toISOString().slice(0, 10);
+};
+
+/** The last period end on or before `at`, the one before it, and the next one. */
+export function payoutPeriods(frequency: string, at = new Date()) {
+  const months = PERIOD_MONTHS[normalFrequency(frequency).toLowerCase()];
+  const { y, m } = lagosToday(at);
+  // Walk back from this month to the latest boundary month.
+  const back = (fromY: number, fromM: number) => {
+    let yy = fromY, mm = fromM;
+    for (let i = 0; i < 13; i++) {
+      if (months.includes(mm)) return { y: yy, m: mm };
+      mm -= 1; if (mm < 0) { mm = 11; yy -= 1; }
+    }
+    return { y: fromY, m: fromM };
+  };
+  const last = back(y, m);
+  const prev = back(last.m === 0 ? last.y - 1 : last.y, last.m === 0 ? 11 : last.m - 1);
+  let ny = last.y, nm = last.m;
+  for (let i = 0; i < 13; i++) { nm += 1; if (nm > 11) { nm = 0; ny += 1; } if (months.includes(nm)) break; }
+  return { last_end: ymd(last.y, last.m), last_start: ymd(prev.y, prev.m), next_end: ymd(ny, nm) };
+}
+
+/** Start of a period end date in Lagos, minus the hold: commissions created before this count. */
+function cutoffFor(periodEnd: string, holdDays: number): Date {
+  return new Date(Date.parse(periodEnd + 'T00:00:00Z') - LAGOS_OFFSET_MS - Math.max(0, holdDays) * 86_400_000);
+}
+
+// A period that ended more than this many days ago is not created late (a
+// partner who joins mid-period waits for the next end; a missed cron run
+// catches up within this window).
+const CATCH_UP_DAYS = 10;
+
+async function frequencyByUser(db: SupabaseClient, userIds: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (!userIds.length) return out;
+  const { data } = await db.from('partner_applications').select('user_id, payout_frequency, created_at')
+    .in('user_id', userIds).order('created_at', { ascending: true });
+  for (const r of data || []) if (r.user_id) out.set(r.user_id, normalFrequency(r.payout_frequency));
+  return out;
+}
+
+export async function runPartnerPayouts(db: SupabaseClient, env: Env, at = new Date()) {
+  const result = { created: 0, below_minimum: 0, exists: 0, not_due: 0, failed: 0 };
+  const flags = await getFlags(db, true);
+  const terms = payoutTerms(flags);
+  if (!terms.enabled) return result;
+
+  const { data: affs, error } = await db.from('affiliates').select('id, user_id').eq('status', 'approved').limit(5000);
+  if (error) { console.error('partner payouts:', error.message); return result; }
+  const freq = await frequencyByUser(db, (affs || []).map(a => a.user_id).filter(Boolean));
+
+  for (const a of affs || []) {
+    const frequency = freq.get(a.user_id) ?? 'Monthly';
+    const p = payoutPeriods(frequency, at);
+    if (at.getTime() - Date.parse(p.last_end + 'T00:00:00Z') + LAGOS_OFFSET_MS > CATCH_UP_DAYS * 86_400_000) { result.not_due++; continue; }
+    const { data, error: rpcErr } = await db.rpc('create_partner_payout', {
+      p_affiliate_id: a.id, p_period_start: p.last_start, p_period_end: p.last_end, p_frequency: frequency,
+      p_hold_days: terms.hold_days, p_min_ngn: terms.min_ngn,
+    });
+    if (rpcErr) { console.error('create_partner_payout:', rpcErr.message); result.failed++; continue; }
+    const r: any = data || {};
+    if (r.result === 'created') {
+      result.created++;
+      await logEvent(db, 'payout', r.id, 'created', null, { amount_ngn: r.amount_ngn, period_end: p.last_end });
+      await notifyUser(db, a.user_id, {
+        kind: 'payout', title: `Payout of ${naira(r.amount_ngn)} is being processed`,
+        body: `Your ${frequency.toLowerCase()} payout is with our team. We’ll let you know when it’s sent.`,
+        href: '/partner/payouts', dedupe: `payout-created:${r.id}`,
+      });
+    } else if (r.result === 'below_minimum') result.below_minimum++;
+    else if (r.result === 'exists') result.exists++;
+  }
+  return result;
+}
+
+export async function handleRunPartnerPayouts(db: SupabaseClient, request: Request, env: Env): Promise<Response> {
+  const auth = await requireAdmin(db, request, env);
+  if (!auth.ok) return auth.response;
+  return ok(await runPartnerPayouts(db, env), request, env);
 }
 
 export async function handleMyPayouts(db: SupabaseClient, request: Request, env: Env): Promise<Response> {
@@ -85,73 +196,43 @@ export async function handleMyPayouts(db: SupabaseClient, request: Request, env:
   if (!aff) return err('No partner account', 404, request, env);
   const terms = payoutTerms(await getFlags(db));
 
-  const cutoff = Date.now() - terms.hold_days * 86_400_000;
-  const [comms, history] = await Promise.all([
+  const [comms, history, app] = await Promise.all([
     db.from('affiliate_commissions')
       .select('amount_ngn, created_at, status, payout_id, orders!inner(status)')
       .eq('affiliate_id', aff.id).is('payout_id', null).in('status', ['pending', 'approved'])
       .eq('orders.status', 'paid').limit(10000),
     db.from('payout_requests')
-      .select('id, amount_ngn, status, created_at, processed_at, admin_note, reference')
+      .select('id, amount_ngn, status, period_start, period_end, frequency, created_at, processed_at, admin_note, reference')
       .eq('affiliate_id', aff.id).order('created_at', { ascending: false }).limit(50),
+    db.from('partner_applications')
+      .select('payout_frequency, payout_method, bank_name, account_number, wallet_address')
+      .eq('user_id', auth.userId).order('created_at', { ascending: false }).limit(1).maybeSingle(),
   ]);
-  if (history.error) return ok({ ...terms, enabled: false, available_ngn: 0, on_hold_ngn: 0, open: null, history: [] }, request, env);
 
-  let available = 0, held = 0;
+  const frequency = normalFrequency(app.data?.payout_frequency);
+  const periods = payoutPeriods(frequency);
+  const cutoff = cutoffFor(periods.next_end, terms.hold_days).getTime();
+  let next = 0, later = 0;
   for (const c of comms.data || []) {
     const amt = Number((c as any).amount_ngn) || 0;
-    if (new Date((c as any).created_at).getTime() < cutoff) available += amt; else held += amt;
+    if (new Date((c as any).created_at).getTime() < cutoff) next += amt; else later += amt;
   }
-  const rows = history.data || [];
+  const d = app.data;
+  const hasDetails = !!((d?.bank_name || aff.bank_name) && (d?.account_number || aff.account_number)) || !!d?.wallet_address;
+  const rows = history.error ? [] : history.data || [];
+  const round = (n: number) => Math.round(n * 100) / 100;
   return ok({
     ...terms,
-    available_ngn: Math.round(available * 100) / 100,
-    on_hold_ngn: Math.round(held * 100) / 100,
-    open: rows.find(r => r.status === 'pending') ?? null,
+    enabled: terms.enabled && !history.error,
+    frequency,
+    next_payout_date: periods.next_end,
+    cutoff_at: new Date(cutoff).toISOString(),
+    next_ngn: round(next),
+    later_ngn: round(later),
+    has_details: hasDetails,
+    open: rows.filter(r => r.status === 'pending'),
     history: rows,
   }, request, env);
-}
-
-const RPC_ERRORS: Record<string, string> = {
-  below_minimum: 'You don’t have enough available to request a payout yet.',
-  already_open: 'You already have a payout request in progress.',
-  not_approved: 'Your partner account isn’t active.',
-  not_found: 'No partner account',
-};
-
-export async function handleRequestPayout(db: SupabaseClient, request: Request, env: Env): Promise<Response> {
-  const auth = await requireAuth(db, request, env);
-  if (!auth.ok) return auth.response;
-  const aff = await affiliateFor(db, auth.userId);
-  if (!aff) return err('No partner account', 404, request, env);
-  const terms = payoutTerms(await getFlags(db));
-  if (!terms.enabled) return err('Payout requests are switched off right now', 503, request, env);
-
-  // Bank details live on the partner application (editable in /partner/profile).
-  const { data: app } = await db.from('partner_applications')
-    .select('payout_method, bank_name, account_name, account_number, crypto_token, crypto_chain, wallet_address')
-    .eq('user_id', auth.userId).maybeSingle();
-  const details = {
-    payout_method: app?.payout_method || 'Bank Transfer',
-    bank_name: app?.bank_name || aff.bank_name, account_name: app?.account_name || aff.account_name,
-    account_number: app?.account_number || aff.account_number,
-    crypto_token: app?.crypto_token || null, crypto_chain: app?.crypto_chain || null, wallet_address: app?.wallet_address || null,
-  };
-  const hasBank = details.bank_name && details.account_number;
-  const hasCrypto = details.payout_method === 'Crypto' && details.wallet_address;
-  if (!hasBank && !hasCrypto) return err('Add your payout details in your profile first', 400, request, env);
-
-  const { data, error } = await db.rpc('request_partner_payout', {
-    p_affiliate_id: aff.id, p_hold_days: terms.hold_days, p_min_ngn: terms.min_ngn,
-  });
-  if (error) {
-    const key = Object.keys(RPC_ERRORS).find(k => error.message.includes(k));
-    return err(key ? RPC_ERRORS[key] : error.message, key ? 409 : 500, request, env);
-  }
-  const row: any = Array.isArray(data) ? data[0] : data;
-  await db.from('payout_requests').update({ payout_details: details }).eq('id', row.id);
-  await logEvent(db, 'payout', row.id, 'requested', auth.userId, { amount_ngn: row.amount_ngn });
-  return ok({ ...row, payout_details: details }, request, env);
 }
 
 export async function handleAdminPayouts(db: SupabaseClient, url: URL, request: Request, env: Env): Promise<Response> {
@@ -194,18 +275,18 @@ export async function handleAdminSettlePayout(db: SupabaseClient, id: string, re
     const paid = action === 'paid';
     await notifyUser(db, userId, {
       kind: 'payout',
-      title: paid ? `Payout of ${naira(p.amount_ngn)} sent` : 'Payout request declined',
+      title: paid ? `Payout of ${naira(p.amount_ngn)} sent` : 'Payout declined',
       body: paid ? (reference ? `Reference ${reference}.` : 'It should reach your account shortly.') : note,
       href: '/partner/payouts', dedupe: `payout:${id}`,
     });
     if (userId) {
       const { data: prof } = await db.from('profiles').select('email').eq('id', userId).maybeSingle();
       if (prof?.email) {
-        await sendEmail(env, prof.email, paid ? `Your BuySub payout of ${naira(p.amount_ngn)} is on its way` : 'Your BuySub payout request', emailHtml({
+        await sendEmail(env, prof.email, paid ? `Your BuySub payout of ${naira(p.amount_ngn)} is on its way` : 'Your BuySub payout', emailHtml({
           heading: paid ? `${naira(p.amount_ngn)} is on its way` : 'We couldn’t process your payout',
           paragraphs: paid
             ? [`We’ve sent your partner payout of ${naira(p.amount_ngn)}.`, ...(reference ? [`Transfer reference: ${reference}`] : [])]
-            : [`Your payout request of ${naira(p.amount_ngn)} was declined.`, `Reason: ${note}`, 'The commissions are available to request again once this is sorted.'],
+            : [`Your payout of ${naira(p.amount_ngn)} was declined.`, `Reason: ${note}`, 'These commissions will be included in your next payout once this is sorted.'],
           cta: { label: 'View payouts', href: `${frontend(env)}/partner/payouts` },
         }));
       }

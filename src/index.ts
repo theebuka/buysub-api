@@ -31,9 +31,10 @@ import {
 import { handleMyReferrals, resolveCustomerCode, rewardReferral } from './features/referrals';
 import { handleCreateStockAlert, sendBackInStock } from './features/stockAlerts';
 import {
-  handleMyPayouts, handleRequestPayout, handleAdminPayouts, handleAdminSettlePayout,
+  handleMyPayouts, handleAdminPayouts, handleAdminSettlePayout, runPartnerPayouts, handleRunPartnerPayouts,
   commissionRate, tierInfo,
 } from './features/payouts';
+import { handleMySaved, handleSaveProduct, handleMergeSaved } from './features/saved';
 import { handleRelatedProducts } from './features/related';
 
 // ── Supabase client factory ──
@@ -497,10 +498,12 @@ export default {
       if (path === '/v2/me/reviews'            && method === 'POST')  return handleSubmitReview(db, request, env)
       if (path.match(/^\/v2\/me\/reviews\/[^/]+$/) && method === 'GET') return handleMyReviewFor(db, decodeURIComponent(path.split('/').pop() || ''), request, env)
       if (path === '/v2/me/referrals'          && method === 'GET')   return handleMyReferrals(db, request, env)
+      if (path === '/v2/me/saved'              && method === 'GET')   return handleMySaved(db, request, env)
+      if (path === '/v2/me/saved/merge'        && method === 'POST')  return handleMergeSaved(db, request, env)
+      if (path.match(/^\/v2\/me\/saved\/[^/]+$/) && (method === 'PUT' || method === 'DELETE')) return handleSaveProduct(db, decodeURIComponent(path.split('/').pop() || ''), method === 'PUT', request, env)
 
       // Partner payouts
       if (path === '/v2/partners/me/payouts'   && method === 'GET')   return handleMyPayouts(db, request, env)
-      if (path === '/v2/partners/me/payouts'   && method === 'POST')  return handleRequestPayout(db, request, env)
 
       // Admin: service switches and programme settings, reviews, payouts, jobs
       if (path === '/v2/admin/flags'           && method === 'GET')   return handleAdminGetFlags(db, request, env)
@@ -510,6 +513,7 @@ export default {
       if (path === '/v2/admin/payouts'         && method === 'GET')   return handleAdminPayouts(db, url, request, env)
       if (path.match(/^\/v2\/admin\/payouts\/[^/]+\/settle$/) && method === 'POST') return handleAdminSettlePayout(db, path.split('/')[4], request, env)
       if (path === '/v2/admin/jobs/renewal-reminders' && method === 'POST') return handleRunRenewalReminders(db, request, env)
+      if (path === '/v2/admin/jobs/partner-payouts'   && method === 'POST') return handleRunPartnerPayouts(db, request, env)
     
       // Admin: send message to customer
       if (path.match(/^\/v2\/admin\/customers\/[^/]+\/messages$/) && method === 'POST') return handleAdminSendMessage(db, request, env)
@@ -534,9 +538,10 @@ export default {
     }
   },
 
-  // Daily cron (wrangler.toml [triggers]): renewal reminders.
+  // Daily cron (wrangler.toml [triggers]): renewal reminders and scheduled partner payouts.
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(runRenewalReminders(getSupabase(env), env).then(r => console.log('renewal reminders', r)));
+    ctx.waitUntil(runPartnerPayouts(getSupabase(env), env).then(r => console.log('partner payouts', r)));
   },
 };
 
