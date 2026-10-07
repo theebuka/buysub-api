@@ -902,35 +902,45 @@ async function insertOrderWithItems(
     source: paymentMethod,
   });
 
-  const { data: refData, error: refErr } = await db.rpc('generate_order_ref');
-  if (refErr || !refData) return { error: 'Could not generate an order reference' };
-  const orderRef = refData as string;
+  // generate_order_ref() skips references already in orders, but two orders
+  // can still draw the same one at once; the UNIQUE constraint on order_ref
+  // rejects the second, and it tries again with a fresh reference.
+  let orderRef = '';
+  let order: any = null;
+  let oErr: any = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { data: refData, error: refErr } = await db.rpc('generate_order_ref');
+    if (refErr || !refData) return { error: 'Could not generate an order reference' };
+    orderRef = refData as string;
 
-  const { data: order, error: oErr } = await db.from('orders').insert({
-    order_ref: orderRef,
-    customer_id: customerId,
-    customer_email: prepared.email,
-    customer_name: body.customer_name || null,
-    customer_phone: body.customer_phone || null,
-    status,
-    payment_method: paymentMethod,
-    subtotal_ngn: prepared.subtotalNGN,
-    discount_ngn: prepared.discountNGN,
-    wallet_ngn: 0,
-    tax_ngn: 0,
-    total_ngn: totalNGN,
-    currency: prepared.currency,
-    fx_rate: prepared.fxRate,
-    display_total: totalNGN * prepared.fxRate,
-    discount_code: prepared.discountCode,
-    affiliate_id: prepared.affiliateId,
-    referral_code: prepared.referralCode,
-    // Only sent when a tier applied: products have no tiers before migration
-    // 19, so orders keep saving without the column.
-    ...(prepared.volumeNGN > 0 ? { volume_discount_ngn: prepared.volumeNGN } : {}),
-    // Only sent when set, so orders still save before migration 12.
-    ...(prepared.referrerUserId ? { referrer_user_id: prepared.referrerUserId } : {}),
-  }).select().single();
+    ({ data: order, error: oErr } = await db.from('orders').insert({
+      order_ref: orderRef,
+      customer_id: customerId,
+      customer_email: prepared.email,
+      customer_name: body.customer_name || null,
+      customer_phone: body.customer_phone || null,
+      status,
+      payment_method: paymentMethod,
+      subtotal_ngn: prepared.subtotalNGN,
+      discount_ngn: prepared.discountNGN,
+      wallet_ngn: 0,
+      tax_ngn: 0,
+      total_ngn: totalNGN,
+      currency: prepared.currency,
+      fx_rate: prepared.fxRate,
+      display_total: totalNGN * prepared.fxRate,
+      discount_code: prepared.discountCode,
+      affiliate_id: prepared.affiliateId,
+      referral_code: prepared.referralCode,
+      // Only sent when a tier applied: products have no tiers before migration
+      // 19, so orders keep saving without the column.
+      ...(prepared.volumeNGN > 0 ? { volume_discount_ngn: prepared.volumeNGN } : {}),
+      // Only sent when set, so orders still save before migration 12.
+      ...(prepared.referrerUserId ? { referrer_user_id: prepared.referrerUserId } : {}),
+    }).select().single());
+
+    if (!(oErr?.code === '23505' && String(oErr.message).includes('order_ref'))) break;
+  }
 
   if (oErr || !order) return { error: 'Failed to create order: ' + (oErr?.message || 'unknown') };
 
@@ -1249,7 +1259,9 @@ async function handlePaystackInit(
   }
 
   // ── Init Paystack transaction ──
-  const paystackRef = `BS-${order.order_ref}-${Date.now()}`;
+  // order_ref already starts with BS-. The timestamp makes each attempt a new
+  // Paystack reference, since Paystack rejects a reused one.
+  const paystackRef = `${order.order_ref}-${Date.now()}`;
 
   let paystackData: any = null;
   try {
