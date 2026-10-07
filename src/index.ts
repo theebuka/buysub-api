@@ -2140,7 +2140,9 @@ async function handleAdminStats(
   const { data, error: rpcErr } = await db.rpc('admin_dashboard_stats');
   if (rpcErr) return err(rpcErr.message, 500, request, env);
 
-  return ok(data, request, env);
+  // Payout requests waiting on staff (migration 15), for the sidebar count.
+  const { count: payouts } = await db.from('payout_requests').select('id', { count: 'exact', head: true }).eq('status', 'pending');
+  return ok({ ...(data as any || {}), payouts_pending: payouts ?? 0 }, request, env);
 }
 
 async function handleAdminCustomers(
