@@ -36,6 +36,10 @@ import {
 } from './features/payouts';
 import { handleMySaved, handleSaveProduct, handleMergeSaved } from './features/saved';
 import { handleMyCart, handlePutCart } from './features/cart';
+import {
+  handleMySupportThreads, handleCreateSupportThread, handleMySupportThread, handleMySupportReply, handleMySupportClose,
+  handleAdminSupportThreads, handleAdminSupportThread, handleAdminSupportReply, handleAdminSupportUpdate, supportWaitingCount,
+} from './features/support';
 import { handleRelatedProducts } from './features/related';
 
 // ── Supabase client factory ──
@@ -504,6 +508,17 @@ export default {
       if (path === '/v2/me/saved'              && method === 'GET')   return handleMySaved(db, request, env)
       if (path === '/v2/me/saved/merge'        && method === 'POST')  return handleMergeSaved(db, request, env)
       if (path.match(/^\/v2\/me\/saved\/[^/]+$/) && (method === 'PUT' || method === 'DELETE')) return handleSaveProduct(db, decodeURIComponent(path.split('/').pop() || ''), method === 'PUT', request, env)
+
+      // Support conversations (migration 18)
+      if (path === '/v2/me/support'            && method === 'GET')   return handleMySupportThreads(db, url, request, env)
+      if (path === '/v2/me/support'            && method === 'POST')  return handleCreateSupportThread(db, request, env)
+      if (path.match(/^\/v2\/me\/support\/[^/]+$/) && method === 'GET') return handleMySupportThread(db, path.split('/')[4], request, env)
+      if (path.match(/^\/v2\/me\/support\/[^/]+\/messages$/) && method === 'POST') return handleMySupportReply(db, path.split('/')[4], request, env)
+      if (path.match(/^\/v2\/me\/support\/[^/]+\/close$/) && method === 'POST') return handleMySupportClose(db, path.split('/')[4], request, env)
+      if (path === '/v2/admin/support'         && method === 'GET')   return handleAdminSupportThreads(db, url, request, env)
+      if (path.match(/^\/v2\/admin\/support\/[^/]+$/) && method === 'GET') return handleAdminSupportThread(db, path.split('/')[4], request, env)
+      if (path.match(/^\/v2\/admin\/support\/[^/]+$/) && method === 'PATCH') return handleAdminSupportUpdate(db, path.split('/')[4], request, env)
+      if (path.match(/^\/v2\/admin\/support\/[^/]+\/messages$/) && method === 'POST') return handleAdminSupportReply(db, path.split('/')[4], request, env)
 
       // Partner payouts
       if (path === '/v2/partners/me/payouts'   && method === 'GET')   return handleMyPayouts(db, request, env)
@@ -2150,7 +2165,9 @@ async function handleAdminStats(
 
   // Payout requests waiting on staff (migration 15), for the sidebar count.
   const { count: payouts } = await db.from('payout_requests').select('id', { count: 'exact', head: true }).eq('status', 'pending');
-  return ok({ ...(data as any || {}), payouts_pending: payouts ?? 0 }, request, env);
+  // Support conversations waiting on a staff reply (migration 18).
+  const support = await supportWaitingCount(db);
+  return ok({ ...(data as any || {}), payouts_pending: payouts ?? 0, support_waiting: support }, request, env);
 }
 
 async function handleAdminCustomers(
