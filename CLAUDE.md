@@ -29,7 +29,7 @@ The shape matters:
 - `src/features/*.ts` — one module per later feature, each with its routes listed in its header comment:
   - `core.ts`: feature flags (`getFlags`, 30s per-isolate cache, `isOn`, `cfg`), the per-user inbox (`notifyUser`), `sendEmail`/`emailHtml`, `userIdForOrder`.
   - `status.ts`: `GET /v2/status`, `serviceBlocked()` (maintenance + per-service switches, enforced server-side), admin flag editing.
-  - `inbox.ts`, `renewals.ts` (expiry dates + the daily cron), `walletFunding.ts` (Paystack top-ups), `reviews.ts` (reviews + sold/rating stats), `referrals.ts` (customer refer-and-earn), `stockAlerts.ts`, `saved.ts` (saved products on the account), `payouts.ts` (scheduled partner payouts by chosen frequency + tiers), `related.ts` (frequently bought together), `paystack.ts`.
+  - `inbox.ts`, `renewals.ts` (expiry dates + the daily cron), `walletFunding.ts` (Paystack top-ups), `reviews.ts` (reviews + sold/rating stats), `referrals.ts` (customer refer-and-earn), `stockAlerts.ts`, `saved.ts` (saved products on the account), `cart.ts` (cart on the account), `payouts.ts` (scheduled partner payouts by chosen frequency + tiers), `related.ts` (frequently bought together), `paystack.ts`.
 - `src/shared/discount.ts` — the discount engine. Pure functions, no I/O.
 - `src/shared/types.ts` — DB row and request/response types.
 

@@ -35,6 +35,7 @@ import {
   commissionRate, tierInfo,
 } from './features/payouts';
 import { handleMySaved, handleSaveProduct, handleMergeSaved } from './features/saved';
+import { handleMyCart, handlePutCart } from './features/cart';
 import { handleRelatedProducts } from './features/related';
 
 // ── Supabase client factory ──
@@ -498,6 +499,8 @@ export default {
       if (path === '/v2/me/reviews'            && method === 'POST')  return handleSubmitReview(db, request, env)
       if (path.match(/^\/v2\/me\/reviews\/[^/]+$/) && method === 'GET') return handleMyReviewFor(db, decodeURIComponent(path.split('/').pop() || ''), request, env)
       if (path === '/v2/me/referrals'          && method === 'GET')   return handleMyReferrals(db, request, env)
+      if (path === '/v2/me/cart'               && method === 'GET')   return handleMyCart(db, request, env)
+      if (path === '/v2/me/cart'               && method === 'PUT')   return handlePutCart(db, request, env)
       if (path === '/v2/me/saved'              && method === 'GET')   return handleMySaved(db, request, env)
       if (path === '/v2/me/saved/merge'        && method === 'POST')  return handleMergeSaved(db, request, env)
       if (path.match(/^\/v2\/me\/saved\/[^/]+$/) && (method === 'PUT' || method === 'DELETE')) return handleSaveProduct(db, decodeURIComponent(path.split('/').pop() || ''), method === 'PUT', request, env)
