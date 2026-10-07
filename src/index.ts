@@ -334,6 +334,40 @@ export default {
         return ok(data, request, env)
       }
 
+      // Edit a notification. The admin composer has always sent PATCH for an
+      // edit, but only the PUT toggle below existed, so edits fell through to
+      // 404. Same fields and rules as the POST above; `active` is left alone.
+      if (path.match(/^\/v2\/admin\/notifications\/[^/]+$/) && method === 'PATCH') {
+        const auth = await requireAdmin(db, request, env)
+        if (!auth.ok) return auth.response
+
+        const id = path.split('/').pop()
+        const body = await request.json().catch(() => null) as any
+        if (!body?.type || (!body?.steps?.length && !body?.message)) {
+          return err('Message or steps required', 400, request, env)
+        }
+
+        const { data, error } = await db
+          .from('notifications')
+          .update({
+            title: body.title || null,
+            message: body.steps?.length ? null : body.message,
+            type: body.type,
+            audience: body.audience || 'all',
+            image_url: body.image_url || null,
+            image_position: body.image_position || 'top',
+            steps: body.steps?.length ? body.steps : null,
+            scheduled_for: body.scheduled_for || null,
+            expires_at: body.expires_at || null,
+          })
+          .eq('id', id)
+          .select()
+          .single()
+
+        if (error) return err(error.message, 500, request, env)
+        return ok(data, request, env)
+      }
+
       if (path.startsWith('/v2/admin/notifications/') && method === 'PUT') {
         const auth = await requireAdmin(db, request, env)
         if (!auth.ok) return auth.response
