@@ -22,11 +22,18 @@ Routes in `wrangler.toml` are commented out — the Worker is reachable on its `
 
 ## Architecture
 
-Three files, and the shape matters:
+The shape matters:
 
-- `src/index.ts` (~4200 lines) — the entire Worker: a hand-rolled router in `export default { fetch }` followed by every handler, helper, and a hand-written PDF writer.
+- `src/index.ts` (~4300 lines) — the router in `export default { fetch, scheduled }`, followed by the original handlers (products, orders, payments, admin, partners, links, ads, account) and a hand-written PDF writer.
+- `src/http.ts` — `Env`, CORS, the `ok`/`err` envelope, `escapeLike`/`orSafe`, `logEvent`, `requireAuth`/`requireAdmin`. Everything imports these from here.
+- `src/features/*.ts` — one module per later feature, each with its routes listed in its header comment:
+  - `core.ts`: feature flags (`getFlags`, 30s per-isolate cache, `isOn`, `cfg`), the per-user inbox (`notifyUser`), `sendEmail`/`emailHtml`, `userIdForOrder`.
+  - `status.ts`: `GET /v2/status`, `serviceBlocked()` (maintenance + per-service switches, enforced server-side), admin flag editing.
+  - `inbox.ts`, `renewals.ts` (expiry dates + the daily cron), `walletFunding.ts` (Paystack top-ups), `reviews.ts` (reviews + sold/rating stats), `referrals.ts` (customer refer-and-earn), `stockAlerts.ts`, `payouts.ts` (partner payout requests + tiers), `related.ts` (frequently bought together), `paystack.ts`.
 - `src/shared/discount.ts` — the discount engine. Pure functions, no I/O.
 - `src/shared/types.ts` — DB row and request/response types.
+
+The tables these features use come from `../supabase-migrations/08`–`15`. They are all additive, so apply them **before** deploying this code (the old code ignores them; this code reads them).
 
 ### Router
 
@@ -76,11 +83,15 @@ Paystack webhook: signature is HMAC-SHA512-verified against `PAYSTACK_SECRET_KEY
 
 Rejection is two-stage: first `POST .../reject` moves `pending`/`pending_manual` → `rejected_pending`; a second call with `{ confirm: true }` moves it to `cancelled`. `POST .../undo-reject` reverses stage one, restoring the previous status and notes from the `rejected_pending` event log's metadata. Confirming a rejection refunds any `wallet_ngn` the order took. The `OrderStatus` union now matches the `order_status` enum, including `rejected_pending`.
 
-Wallet: deducted at most once per order. `/v2/pay/init` claims it with a conditional update on `wallet_ngn = 0` before calling `debit_wallet`, reverts if the RPC fails, and refunds via `credit_wallet` if Paystack can't be started. Disabled wallets (`is_active = false`) are skipped. Full-wallet-coverage orders skip Paystack and call `fulfillOrder(..., 'wallet', ...)` directly.
+`fulfillOrder` also sets `order_items.starts_at/expires_at` (renewal reminders), posts an inbox notice, pays the refer-and-earn reward (`rewardReferral`) and, with partner tiers on, uses the tier rate for the commission (`commissionRate`). The webhook routes transactions whose `metadata.kind` is `wallet_topup` to `settleTopupTx` instead of the order path.
+
+Service switches (`feature_flags`, see `features/status.ts`): `POST /v2/orders` needs `paystack_checkout`, `/v2/orders/whatsapp` needs `whatsapp_checkout`, wallet use needs `wallet_enabled`, partner applications need `partner_applications`; `maintenance_mode` blocks all of them. A switch missing from the table counts as on.
+
+Wallet: deducted at most once per order, and only for the signed-in owner of the order's customer record (the bearer token must match `customers.user_id`). `/v2/pay/init` claims it with a conditional update on `wallet_ngn = 0` before calling `debit_wallet`, reverts if the RPC fails, and refunds via `credit_wallet` if Paystack can't be started. Disabled wallets (`is_active = false`) are skipped. Full-wallet-coverage orders skip Paystack and call `fulfillOrder(..., 'wallet', ...)` directly.
 
 ### Supabase specifics
 
-`getSupabase(env)` creates a fresh service-role client per request with sessions disabled. Balance mutations must go through the Postgres RPCs, never a read-modify-write on `wallets.balance_ngn`: `credit_wallet`, `debit_wallet`. Other RPCs the Worker depends on: `generate_order_ref`, `increment_discount_usage`, `admin_dashboard_stats`, `partner_dashboard_stats`, `affiliate_dashboard_stats`, `short_link_stats`, `get_ads_by_placement`, `increment_ad_click`, `increment_ad_views` (the last two fall back to read/write if missing). Dashboard RPCs are `SECURITY DEFINER`: only `service_role` may execute them (see `../supabase-migrations/02_*`). The schema and these functions live in Supabase, not in this repo — there are no migrations here, so a new column or RPC has to be applied in the Supabase dashboard before the Worker code referencing it is deployed.
+`getSupabase(env)` creates a fresh service-role client per request with sessions disabled. Balance mutations must go through the Postgres RPCs, never a read-modify-write on `wallets.balance_ngn`: `credit_wallet`, `debit_wallet`. Other RPCs the Worker depends on: `settle_wallet_topup`, `product_public_stats`, `grant_referral_reward`, `request_partner_payout`, `settle_partner_payout` (migrations 10–15), `generate_order_ref`, `increment_discount_usage`, `admin_dashboard_stats`, `partner_dashboard_stats`, `affiliate_dashboard_stats`, `short_link_stats`, `get_ads_by_placement`, `increment_ad_click`, `increment_ad_views` (the last two fall back to read/write if missing). Dashboard RPCs are `SECURITY DEFINER`: only `service_role` may execute them (see `../supabase-migrations/02_*`). The schema and these functions live in Supabase, not in this repo — there are no migrations here, so a new column or RPC has to be applied in the Supabase dashboard before the Worker code referencing it is deployed.
 
 Two-table customer identity: `profiles` (keyed by the Supabase auth UUID, holds `role`) and `customers` (order-facing, may exist with `user_id = null` for guest checkout). The `handle_new_user` auth trigger creates the profile, wallet and customer row (claiming a guest customer with the same email). `handleCustomerSignup` takes identity from the bearer token only — never `user_id` from the body — and never sets `role`. It fills name/phone/gender and is idempotent. Customer emails are matched case-insensitively (`customers_email_unique_ci` is on `lower(email)`): use `escapeLike` + `.ilike`, never `.eq`. Search text going into `.or()` goes through `orSafe`. `handleUpdateMe` writes to both. Anything touching a customer must tolerate `customers.user_id` being null.
 

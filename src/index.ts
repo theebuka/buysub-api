@@ -18,6 +18,23 @@ import {
   type Env, corsHeaders, jsonResponse, ok, err, escapeLike, orSafe, logEvent,
   requireAdmin, requireAuth, STAFF_ROLES, EMAIL_RE,
 } from './http';
+import { paystackVerifyTx, safeCallbackUrl } from './features/paystack';
+import { getFlags, isOn, notifyUser, userIdForOrder, naira } from './features/core';
+import { handleStatus, serviceBlocked, handleAdminGetFlags, handleAdminUpdateFlag } from './features/status';
+import { handleGetMyNotifications, handleReadMyNotifications } from './features/inbox';
+import { setOrderExpiry, runRenewalReminders, handleRunRenewalReminders } from './features/renewals';
+import { handleFundWallet, handleVerifyWalletFunding, settleTopupTx, TOPUP_KIND } from './features/walletFunding';
+import {
+  attachProductStats, handleGetProductReviews, handleMyReviewFor, handleSubmitReview,
+  handleAdminReviews, handleAdminUpdateReview,
+} from './features/reviews';
+import { handleMyReferrals, resolveCustomerCode, rewardReferral } from './features/referrals';
+import { handleCreateStockAlert, sendBackInStock } from './features/stockAlerts';
+import {
+  handleMyPayouts, handleRequestPayout, handleAdminPayouts, handleAdminSettlePayout,
+  commissionRate, tierInfo,
+} from './features/payouts';
+import { handleRelatedProducts } from './features/related';
 
 // ── Supabase client factory ──
 function getSupabase(env: Env): SupabaseClient {
@@ -44,6 +61,13 @@ export default {
       // ── Products ──
       if (path === '/v2/products' && method === 'GET') {
         return handleGetProducts(db, url, request, env);
+      }
+      const productSub = path.match(/^\/v2\/products\/([^/]+)\/(reviews|related)$/);
+      if (productSub && method === 'GET') {
+        const slug = decodeURIComponent(productSub[1]);
+        return productSub[2] === 'reviews'
+          ? handleGetProductReviews(db, slug, url, request, env)
+          : handleRelatedProducts(db, slug, request, env);
       }
       if (path.startsWith('/v2/products/') && method === 'GET') {
         const slug = path.split('/v2/products/')[1];
@@ -98,6 +122,10 @@ export default {
       if (path === '/v2/customers/search' && method === 'GET') {
         return handleSearchCustomers(db, url, request, env);
       }
+
+      // ── Service switches, back-in-stock alerts ──
+      if (path === '/v2/status' && method === 'GET') return handleStatus(db, request, env);
+      if (path === '/v2/stock-alerts' && method === 'POST') return handleCreateStockAlert(db, request, env);
 
       // ── Health ──
       if (path === '/v2/health') {
@@ -462,6 +490,26 @@ export default {
       if (path === '/v2/me/wallet/transactions'&& method === 'GET')   return handleGetMyWalletTxns(db, request, env)
       if (path === '/v2/me/messages'           && method === 'GET')   return handleGetMyMessages(db, request, env)
       if (path.match(/^\/v2\/me\/messages\/[^/]+\/read$/) && method === 'PATCH') return handleMarkMessageRead(db, request, env)
+      if (path === '/v2/me/notifications'      && method === 'GET')   return handleGetMyNotifications(db, url, request, env)
+      if (path === '/v2/me/notifications/read' && method === 'POST')  return handleReadMyNotifications(db, request, env)
+      if (path === '/v2/me/wallet/fund'        && method === 'POST')  return handleFundWallet(db, request, env)
+      if (path === '/v2/me/wallet/fund/verify' && method === 'GET')   return handleVerifyWalletFunding(db, url, request, env)
+      if (path === '/v2/me/reviews'            && method === 'POST')  return handleSubmitReview(db, request, env)
+      if (path.match(/^\/v2\/me\/reviews\/[^/]+$/) && method === 'GET') return handleMyReviewFor(db, decodeURIComponent(path.split('/').pop() || ''), request, env)
+      if (path === '/v2/me/referrals'          && method === 'GET')   return handleMyReferrals(db, request, env)
+
+      // Partner payouts
+      if (path === '/v2/partners/me/payouts'   && method === 'GET')   return handleMyPayouts(db, request, env)
+      if (path === '/v2/partners/me/payouts'   && method === 'POST')  return handleRequestPayout(db, request, env)
+
+      // Admin: service switches and programme settings, reviews, payouts, jobs
+      if (path === '/v2/admin/flags'           && method === 'GET')   return handleAdminGetFlags(db, request, env)
+      if (path.match(/^\/v2\/admin\/flags\/[a-z_]+$/) && method === 'PATCH') return handleAdminUpdateFlag(db, path.split('/').pop() || '', request, env)
+      if (path === '/v2/admin/reviews'         && method === 'GET')   return handleAdminReviews(db, url, request, env)
+      if (path.match(/^\/v2\/admin\/reviews\/[^/]+$/) && method === 'PATCH') return handleAdminUpdateReview(db, path.split('/').pop() || '', request, env)
+      if (path === '/v2/admin/payouts'         && method === 'GET')   return handleAdminPayouts(db, url, request, env)
+      if (path.match(/^\/v2\/admin\/payouts\/[^/]+\/settle$/) && method === 'POST') return handleAdminSettlePayout(db, path.split('/')[4], request, env)
+      if (path === '/v2/admin/jobs/renewal-reminders' && method === 'POST') return handleRunRenewalReminders(db, request, env)
     
       // Admin: send message to customer
       if (path.match(/^\/v2\/admin\/customers\/[^/]+\/messages$/) && method === 'POST') return handleAdminSendMessage(db, request, env)
@@ -484,6 +532,11 @@ export default {
       console.error('Unhandled error:', e);
       return err('Internal server error', 500, request, env);
     }
+  },
+
+  // Daily cron (wrangler.toml [triggers]): renewal reminders.
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runRenewalReminders(getSupabase(env), env).then(r => console.log('renewal reminders', r)));
   },
 };
 
@@ -531,7 +584,8 @@ async function handleGetProducts(
 
   const { data, error, count } = await query;
   if (error) return err(error.message, 500, request, env);
-  return ok(data, request, env, { count: count ?? data?.length, offset, limit });
+  const withStats = await attachProductStats(db, (data || []) as any[]);
+  return ok(withStats, request, env, { count: count ?? data?.length, offset, limit });
 }
 
 
@@ -549,7 +603,8 @@ async function handleGetProductBySlug(
     .single();
 
   if (error || !data) return err('Product not found', 404, request, env);
-  return ok(data, request, env);
+  const [withStats] = await attachProductStats(db, [data as any]);
+  return ok(withStats, request, env);
 }
 
 
@@ -674,6 +729,8 @@ type PreparedOrder = {
   discountCode: string | null;
   affiliateId: string | null;
   referralCode: string | null;
+  /** A customer's refer-and-earn code was used (features/referrals.ts). */
+  referrerUserId: string | null;
   currency: string;
   fxRate: number;
 };
@@ -779,13 +836,19 @@ async function prepareOrder(
       referralCode = refCode;
     }
   }
+  // Not a partner code: maybe a customer's refer-and-earn code.
+  let referrerUserId: string | null = null;
+  if (refCode && !affiliateId) {
+    const ref = await resolveCustomerCode(db, refCode);
+    if (ref) { referrerUserId = ref.userId; referralCode = refCode; }
+  }
 
   const currency = SUPPORTED_CURRENCIES.includes(body.currency) ? body.currency : 'NGN';
   const fxRate = Number(body.fx_rate) > 0 && Number.isFinite(Number(body.fx_rate)) ? Number(body.fx_rate) : 1;
 
   return {
     ok: true,
-    order: { email, items, subtotalNGN, discountNGN, discountCode, affiliateId, referralCode, currency, fxRate: currency === 'NGN' ? 1 : fxRate },
+    order: { email, items, subtotalNGN, discountNGN, discountCode, affiliateId, referralCode, referrerUserId, currency, fxRate: currency === 'NGN' ? 1 : fxRate },
   };
 }
 
@@ -825,6 +888,8 @@ async function insertOrderWithItems(
     discount_code: prepared.discountCode,
     affiliate_id: prepared.affiliateId,
     referral_code: prepared.referralCode,
+    // Only sent when set, so orders still save before migration 12.
+    ...(prepared.referrerUserId ? { referrer_user_id: prepared.referrerUserId } : {}),
   }).select().single();
 
   if (oErr || !order) return { error: 'Failed to create order: ' + (oErr?.message || 'unknown') };
@@ -865,6 +930,8 @@ async function handleCreateOrder(
   db: SupabaseClient, request: Request, env: Env,
 ): Promise<Response> {
   try {
+    const blocked = await serviceBlocked(db, 'paystack_checkout', request, env);
+    if (blocked) return blocked;
     const body = await request.json().catch(() => null) as CreateOrderRequest | null;
     if (!body) return err('Invalid request body', 400, request, env);
 
@@ -895,6 +962,8 @@ async function handleWhatsAppOrder(
   db: SupabaseClient, request: Request, env: Env,
 ): Promise<Response> {
   try {
+    const blocked = await serviceBlocked(db, 'whatsapp_checkout', request, env);
+    if (blocked) return blocked;
     const body = await request.json().catch(() => null) as CreateOrderRequest | null;
     if (!body) return err('Invalid request body', 400, request, env);
 
@@ -967,17 +1036,6 @@ async function handleWhatsAppOrder(
 // PAYSTACK HELPERS
 // ============================================================
 
-async function paystackVerifyTx(reference: string, env: Env): Promise<any | null> {
-  try {
-    const res = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, {
-      headers: { Authorization: `Bearer ${env.PAYSTACK_SECRET_KEY}` },
-    });
-    const json = await res.json() as any;
-    return json?.status ? json.data : null;
-  } catch {
-    return null;
-  }
-}
 
 // Turn a successful Paystack transaction into a paid order. Shared by the
 // webhook, /v2/pay/verify and /v2/pay/init (an earlier attempt already paid).
@@ -1019,20 +1077,6 @@ async function findOrderForTx(db: SupabaseClient, tx: any): Promise<any | null> 
   return byId ?? null;
 }
 
-// Paystack redirects here after payment, so only allow our own origins.
-function safeCallbackUrl(requested: string | undefined, env: Env): string {
-  const fallback = `${env.FRONTEND_URL}/order/verify`;
-  if (!requested) return fallback;
-  try {
-    const u = new URL(requested);
-    const allowed = [env.FRONTEND_URL, ...(env.ALLOWED_ORIGINS?.split(',') || [])]
-      .map(s => s?.trim()).filter(Boolean)
-      .map(s => { try { return new URL(s).origin; } catch { return ''; } });
-    return allowed.includes(u.origin) ? u.toString() : fallback;
-  } catch {
-    return fallback;
-  }
-}
 
 async function refundWalletForOrder(db: SupabaseClient, order: any, amount: number, reason: string): Promise<void> {
   if (!(amount > 0) || !order.customer_id) return;
@@ -1060,6 +1104,15 @@ async function handlePaystackInit(
   const body = await request.json().catch(() => null) as (PaystackInitRequest & { use_wallet?: boolean }) | null;
 
   if (!body?.order_id) return err('order_id is required', 400, request, env);
+
+  const flags = await getFlags(db);
+  const down = await serviceBlocked(db, null, request, env); // maintenance
+  if (down) return down;
+  const paystackOn = isOn(flags, 'paystack_checkout');
+  if (body.use_wallet && !isOn(flags, 'wallet_enabled')) {
+    return err('Paying from your wallet is paused right now.', 503, request, env);
+  }
+  if (!paystackOn && !body.use_wallet) return (await serviceBlocked(db, 'paystack_checkout', request, env))!;
 
   // Fetch order
   const { data: order, error: oErr } = await db.from('orders')
@@ -1090,6 +1143,13 @@ async function handlePaystackInit(
   if (body.use_wallet && order.customer_id && !(Number(order.wallet_ngn) > 0)) {
     const { data: customer } = await db.from('customers')
       .select('user_id').eq('id', order.customer_id).single();
+
+    // Only the wallet's owner, signed in, can spend it. This used to need
+    // nothing but the order id.
+    const auth = await requireAuth(db, request, env);
+    if (!auth.ok || !customer?.user_id || auth.userId !== customer.user_id) {
+      return err('Sign in to the account that placed this order to pay from its wallet.', 403, request, env);
+    }
 
     if (customer?.user_id) {
       const { data: wallet } = await db.from('wallets')
@@ -1138,6 +1198,11 @@ async function handlePaystackInit(
     await refundWalletForOrder(db, order, walletDeducted, 'paystack init failed');
     await db.from('orders').update({ wallet_ngn: 0, total_ngn: originalTotal }).eq('id', order.id);
   };
+
+  if (!paystackOn) {
+    await undoWallet();
+    return err('Card and bank payments are paused right now, and your wallet doesn’t cover this order.', 503, request, env);
+  }
 
   // ── Init Paystack transaction ──
   const paystackRef = `BS-${order.order_ref}-${Date.now()}`;
@@ -1224,6 +1289,19 @@ async function handlePaystackWebhook(
     if (peErr.code === '23505') return new Response('Already processed', { status: 200 });
     console.error('Webhook: could not record payment event', peErr.message);
     return new Response('Retry', { status: 500 });
+  }
+
+  // Wallet top-ups (features/walletFunding.ts) aren't orders.
+  if (tx?.metadata?.kind === TOPUP_KIND) {
+    try {
+      const r = await settleTopupTx(db, tx);
+      if (r === 'missing' || r === 'mismatch') console.error(`Webhook: top-up ${reference} ${r}`);
+    } catch (e: any) {
+      console.error('Webhook top-up failed:', e?.message);
+      await db.from('payment_events').delete().eq('payment_reference', reference);
+      return new Response('Retry', { status: 500 });
+    }
+    return new Response('OK', { status: 200 });
   }
 
   const order = await findOrderForTx(db, tx);
@@ -1580,6 +1658,9 @@ async function fulfillOrder(
 
   console.log('Fulfillment started:', orderId);
 
+  // Subscription end dates, for renewal reminders (features/renewals.ts).
+  await setOrderExpiry(db, order);
+
   // 3. Discount usage. discount_usages is unique on (discount_id, customer_id);
   //    only count the use when that row is new.
   if (order.discount_code) {
@@ -1618,7 +1699,9 @@ async function fulfillOrder(
 
       if (!isSelfReferral) {
         const base = Math.max(0, Number(order.subtotal_ngn) - Number(order.discount_ngn || 0));
-        const commissionAmount = base * (Number(aff.commission_rate) / 100);
+        // The partner's own rate, or their tier's when tiers are on (features/payouts.ts).
+        const rate = await commissionRate(db, order.affiliate_id, Number(aff.commission_rate) || 0, order.id);
+        const commissionAmount = base * (rate / 100);
         // One commission per order (unique index on order_id); a duplicate insert just fails.
         const { error: commErr } = await db.from('affiliate_commissions').insert({
           affiliate_id: order.affiliate_id,
@@ -1638,7 +1721,17 @@ async function fulfillOrder(
     console.error('Email send failed:', e);
   }
 
-  // 6. Log fulfillment
+  // 6. Inbox notice, and the refer-and-earn reward (both never throw)
+  await notifyUser(db, await userIdForOrder(db, order), {
+    kind: 'order',
+    title: `Order ${order.order_ref} confirmed`,
+    body: 'Payment received. Your receipt is in your email.',
+    href: `/account/orders/${encodeURIComponent(order.order_ref)}`,
+    dedupe: `order:${order.order_ref}:paid`,
+  });
+  await rewardReferral(db, order);
+
+  // 7. Log fulfillment
   await logEvent(db, 'order', order.id, 'fulfilled', null, {
     order_ref: order.order_ref,
     payment_method: paymentMethod,
@@ -2146,6 +2239,8 @@ async function handleAdminUpdateProduct(
   const updates: Record<string, any> = picked.fields;
   updates.updated_at = new Date().toISOString();
 
+  const { data: before } = await db.from('products').select('stock_status').eq('id', productId).maybeSingle();
+
   const { data, error: dbErr } = await db
     .from('products')
     .update(updates)
@@ -2154,7 +2249,13 @@ async function handleAdminUpdateProduct(
     .single();
 
   if (dbErr) return err(dbErr.message, 500, request, env);
-  return ok(data, request, env);
+
+  // Back in stock: tell everyone who asked (features/stockAlerts.ts).
+  let alerted = 0;
+  if (before && before.stock_status !== 'in_stock' && data?.stock_status === 'in_stock' && data.status === 'active') {
+    alerted = await sendBackInStock(db, env, data);
+  }
+  return ok(data, request, env, alerted ? { stock_alerts_sent: alerted } : undefined);
 }
 
 const MANUAL_PAYMENT_METHODS = ['whatsapp', 'bank_transfer', 'cash', 'wallet', 'free', 'paystack'];
@@ -2212,7 +2313,7 @@ async function handleAdminRejectOrder(
 
   const { data: order, error: findErr } = await db
     .from('orders')
-    .select('id, status, order_ref, notes, wallet_ngn, customer_id')
+    .select('id, status, order_ref, notes, wallet_ngn, customer_id, customer_email')
     .eq('order_ref', ref)
     .single();
 
@@ -2234,6 +2335,16 @@ async function handleAdminRejectOrder(
     if (Number(order.wallet_ngn) > 0) {
       await refundWalletForOrder(db, order, Number(order.wallet_ngn), 'cancelled');
     }
+
+    await notifyUser(db, await userIdForOrder(db, order), {
+      kind: 'order',
+      title: `Order ${order.order_ref} was cancelled`,
+      body: Number(order.wallet_ngn) > 0
+        ? `${naira(order.wallet_ngn)} from your wallet has been returned.${reason ? ` Reason: ${reason}` : ''}`
+        : reason ? `Reason: ${reason}` : 'Contact support if you have questions.',
+      href: `/account/orders/${encodeURIComponent(order.order_ref)}`,
+      dedupe: `order:${order.order_ref}:cancelled`,
+    });
 
     await logEvent(db, 'order', order.id, 'rejected_confirmed', auth.userId, {
       order_ref: order.order_ref, reason,
@@ -2267,6 +2378,8 @@ async function handleAdminRejectOrder(
 async function handleSubmitPartnerApplication(
   db: SupabaseClient, request: Request, env: Env
 ): Promise<Response> {
+  const closed = await serviceBlocked(db, 'partner_applications', request, env);
+  if (closed) return closed;
   const body = await request.json().catch(() => null) as any;
   if (!body) return err('Invalid request body', 400, request, env);
  
@@ -2663,6 +2776,8 @@ async function handlePartnerMyStats(
       if (days[d]) { days[d].conversions++; days[d].earned_ngn += Number(c.amount_ngn) || 0 }
     }
     stats.commission_rate = aff.data?.commission_rate ?? null;
+    // Tier progress, when partner tiers are on (features/payouts.ts).
+    stats.tier = await tierInfo(db, affiliateId, Number(aff.data?.commission_rate) || 0);
     stats.approved_ngn = (approved.data || []).reduce((s: number, r: any) => s + (Number(r.amount_ngn) || 0), 0);
     stats.daily = Object.values(days);
   }
@@ -2771,6 +2886,8 @@ async function handleAffiliateClick(
     .single();
  
   if (!affiliate || affiliate.status !== 'approved') {
+    // Customer refer-and-earn codes are valid but their clicks aren't tracked.
+    if (await resolveCustomerCode(db, code)) return ok({ tracked: false }, request, env);
     return err('Invalid or inactive referral code', 404, request, env);
   }
  
@@ -2801,10 +2918,16 @@ async function handleAffiliateResolve(
     .eq('status', 'approved')
     .single();
  
-  if (!affiliate) return ok({ valid: false }, request, env);
+  if (!affiliate) {
+    // A customer's refer-and-earn code (features/referrals.ts).
+    const friend = await resolveCustomerCode(db, code);
+    if (friend) return ok({ valid: true, kind: 'customer', referral_code: code, store_name: friend.firstName || null }, request, env);
+    return ok({ valid: false }, request, env);
+  }
  
   return ok({
     valid: true,
+    kind: 'partner',
     affiliate_id: affiliate.id,
     referral_code: affiliate.referral_code,
     store_name: affiliate.store_name || affiliate.business_name,
@@ -3960,7 +4083,7 @@ const MY_ORDER_COLUMNS = `
   created_at, updated_at, paid_at,
   order_items (
     id, product_id, product_name, category, billing_period, billing_type,
-    duration_months, quantity, unit_price_ngn, total_price_ngn,
+    duration_months, quantity, unit_price_ngn, total_price_ngn, starts_at, expires_at,
     products ( slug, domain, image_url )
   )
 `
@@ -4191,6 +4314,12 @@ async function handleAdminWalletTopup(db: any, request: Request, env: any): Prom
     amount_ngn: body.amount_ngn,
     customer_id: customerId,
     new_balance: newBalance,
+  })
+  await notifyUser(db, userId, {
+    kind: 'wallet',
+    title: `${naira(body.amount_ngn)} added to your wallet`,
+    body: body.source === 'refund' ? 'A refund from BuySub.' : 'A credit from BuySub.',
+    href: '/account/wallet',
   })
  
   // fetch fresh balance

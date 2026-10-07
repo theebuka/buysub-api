@@ -30,6 +30,11 @@ ALLOWED_ORIGINS = "https://app.buysub.ng,https://buysub.ng,http://localhost:3000
 #   { pattern = "buysub-api.ebuka-nwaju.workers.dev/v2/*", zone_name = "ebuka-nwaju.workers.dev" }
 # ]
 
+# Daily at 08:00 UTC (09:00 in Lagos): subscription renewal reminders
+# (src/features/renewals.ts). Turned off without a deploy from admin Settings.
+[triggers]
+crons = ["0 8 * * *"]
+
 [build]
 command = "npm run build"
 
