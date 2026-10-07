@@ -1201,40 +1201,63 @@ async function handlePaystackInit(
     // Only the wallet's owner, signed in, can spend it. This used to need
     // nothing but the order id.
     const auth = await requireAuth(db, request, env);
-    if (!auth.ok || !customer?.user_id || auth.userId !== customer.user_id) {
+    if (!auth.ok) {
       return err('Sign in to the account that placed this order to pay from its wallet.', 403, request, env);
     }
 
-    if (customer?.user_id) {
-      const { data: wallet } = await db.from('wallets')
-        .select('*').eq('user_id', customer.user_id).single();
+    // A checkout customer row the account never claimed (handle_new_user
+    // only claims at sign-up, and completeProfile doesn't run for staff):
+    // the token proves the email, so link it now. customers_user_id_unique
+    // stops this if the account already has another customer row.
+    if (customer && !customer.user_id && auth.email
+      && auth.email.toLowerCase() === String(order.customer_email || '').toLowerCase()) {
+      const { data: linked } = await db.from('customers')
+        .update({ user_id: auth.userId })
+        .eq('id', order.customer_id).is('user_id', null)
+        .select('user_id');
+      if (linked?.length) customer.user_id = auth.userId;
+    }
 
-      if (wallet && wallet.is_active !== false && Number(wallet.balance_ngn) > 0) {
-        const amount = Math.min(Number(wallet.balance_ngn), amountToCharge);
+    if (!customer?.user_id || auth.userId !== customer.user_id) {
+      return err('Sign in to the account that placed this order to pay from its wallet.', 403, request, env);
+    }
 
-        // Claim the deduction on the order first, so two concurrent inits can't both debit.
-        const { data: claimed } = await db.from('orders')
-          .update({ wallet_ngn: amount, total_ngn: amountToCharge - amount })
-          .eq('id', order.id)
-          .eq('status', 'pending')
-          .or('wallet_ngn.is.null,wallet_ngn.eq.0')
-          .select('id');
+    const { data: wallet } = await db.from('wallets')
+      .select('*').eq('user_id', customer.user_id).single();
 
-        if (claimed?.length) {
-          const { error: debitErr } = await db.rpc('debit_wallet', {
-            p_wallet_id: wallet.id,
-            p_amount: amount,
-            p_reference: order.order_ref,
-          });
-          if (debitErr) {
-            await db.from('orders').update({ wallet_ngn: 0, total_ngn: originalTotal }).eq('id', order.id);
-            return err('Could not use your wallet balance: ' + debitErr.message, 409, request, env);
-          }
-          walletDeducted = amount;
-          amountToCharge -= amount;
+    if (wallet && wallet.is_active !== false && Number(wallet.balance_ngn) > 0) {
+      const amount = Math.min(Number(wallet.balance_ngn), amountToCharge);
+
+      // Claim the deduction on the order first, so two concurrent inits can't both debit.
+      const { data: claimed } = await db.from('orders')
+        .update({ wallet_ngn: amount, total_ngn: amountToCharge - amount })
+        .eq('id', order.id)
+        .eq('status', 'pending')
+        .or('wallet_ngn.is.null,wallet_ngn.eq.0')
+        .select('id');
+
+      if (claimed?.length) {
+        const { error: debitErr } = await db.rpc('debit_wallet', {
+          p_wallet_id: wallet.id,
+          p_amount: amount,
+          p_reference: order.order_ref,
+        });
+        if (debitErr) {
+          await db.from('orders').update({ wallet_ngn: 0, total_ngn: originalTotal }).eq('id', order.id);
+          return err('Could not use your wallet balance: ' + debitErr.message, 409, request, env);
         }
+        walletDeducted = amount;
+        amountToCharge -= amount;
       }
     }
+  }
+
+  // Checkout showed the shopper a total with the wallet taken off. If none of
+  // it could be taken (empty or disabled wallet, lost claim), stop rather than
+  // charge them the full amount on Paystack. A retry of an order whose wallet
+  // part is already taken passes: its total_ngn is already the remainder.
+  if (body.use_wallet && walletDeducted === 0 && !(Number(order.wallet_ngn) > 0)) {
+    return err('Your wallet balance couldn’t be applied to this order, so nothing was charged. Refresh and try again.', 409, request, env);
   }
 
   // If fully paid by wallet
@@ -1414,7 +1437,46 @@ async function handlePaystackVerify(
     order_ref: order.order_ref,
     status: 'paid',
     amount_ngn: tx.amount / 100,
+    summary: await verifySummary(db, order),
   }, request, env);
+}
+
+// What the confirmation page shows. Anyone holding the Paystack reference can
+// load this, so it carries the items and amounts but only a masked email and a
+// first name. Best effort: a failed read returns null, never a failed verify.
+async function verifySummary(db: SupabaseClient, order: any) {
+  try {
+    const { data: items } = await db.from('order_items')
+      .select('product_name, billing_period, billing_type, duration_months, quantity, total_price_ngn, products(slug, domain, image_url, delivery_time)')
+      .eq('order_id', order.id);
+    const email = String(order.customer_email || '');
+    const [user, host] = email.split('@');
+    return {
+      first_name: String(order.customer_name || '').trim().split(/\s+/)[0] || null,
+      email_masked: user && host ? `${user.slice(0, 2)}${'•'.repeat(Math.max(1, Math.min(6, user.length - 2)))}@${host}` : null,
+      paid_at: order.paid_at || new Date().toISOString(),
+      currency: order.currency || 'NGN',
+      fx_rate: Number(order.fx_rate) || 1,
+      subtotal_ngn: Number(order.subtotal_ngn) || 0,
+      discount_ngn: Number(order.discount_ngn) || 0,
+      wallet_ngn: Number(order.wallet_ngn) || 0,
+      total_ngn: Number(order.total_ngn) || 0,
+      items: (items || []).map((i: any) => ({
+        name: i.product_name,
+        period: i.billing_period,
+        billing_type: i.billing_type,
+        months: i.duration_months,
+        quantity: i.quantity,
+        total_ngn: Number(i.total_price_ngn) || 0,
+        slug: i.products?.slug ?? null,
+        domain: i.products?.domain ?? null,
+        image_url: i.products?.image_url ?? null,
+        delivery_time: i.products?.delivery_time ?? null,
+      })),
+    };
+  } catch {
+    return null;
+  }
 }
 
 
