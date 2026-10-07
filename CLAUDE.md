@@ -85,7 +85,7 @@ Rejection is two-stage: first `POST .../reject` moves `pending`/`pending_manual`
 
 `fulfillOrder` also sets `order_items.starts_at/expires_at` (renewal reminders), posts an inbox notice, pays the refer-and-earn reward (`rewardReferral`) and, with partner tiers on, uses the tier rate for the commission (`commissionRate`). The webhook routes transactions whose `metadata.kind` is `wallet_topup` to `settleTopupTx` instead of the order path.
 
-Service switches (`feature_flags`, see `features/status.ts`): `POST /v2/orders` needs `paystack_checkout`, `/v2/orders/whatsapp` needs `whatsapp_checkout`, wallet use needs `wallet_enabled`, partner applications need `partner_applications`; `maintenance_mode` blocks all of them. A switch missing from the table counts as on.
+Service switches (`feature_flags`, see `features/status.ts`): `/v2/pay/init` needs `paystack_checkout` unless the wallet covers the order, `/v2/orders/whatsapp` needs `whatsapp_checkout`, wallet use needs `wallet_enabled`, partner applications need `partner_applications`; `maintenance_mode` blocks all of them. A switch missing from the table counts as on.
 
 Wallet: deducted at most once per order, and only for the signed-in owner of the order's customer record (the bearer token must match `customers.user_id`). `/v2/pay/init` claims it with a conditional update on `wallet_ngn = 0` before calling `debit_wallet`, reverts if the RPC fails, and refunds via `credit_wallet` if Paystack can't be started. Disabled wallets (`is_active = false`) are skipped. Full-wallet-coverage orders skip Paystack and call `fulfillOrder(..., 'wallet', ...)` directly.
 

@@ -930,7 +930,9 @@ async function handleCreateOrder(
   db: SupabaseClient, request: Request, env: Env,
 ): Promise<Response> {
   try {
-    const blocked = await serviceBlocked(db, 'paystack_checkout', request, env);
+    // Maintenance only: the paystack_checkout switch is enforced at /v2/pay/init,
+    // so an order the wallet fully covers can still be placed while it's off.
+    const blocked = await serviceBlocked(db, null, request, env);
     if (blocked) return blocked;
     const body = await request.json().catch(() => null) as CreateOrderRequest | null;
     if (!body) return err('Invalid request body', 400, request, env);
