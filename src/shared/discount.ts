@@ -1,7 +1,7 @@
 // ============================================================
 // BUYSUB — SHARED CONSTANTS & DISCOUNT ENGINE
 // ============================================================
-import type { CartItemPayload, DiscountCode, DiscountType } from './types';
+import type { CartItemPayload, DiscountCode, DiscountType, VolumeTier } from './types';
 
 // ── Periods ──
 export const PERIODS = {
@@ -138,7 +138,9 @@ export function isItemEligibleForDiscount(
 }
 
 /**
- * Calculate the eligible subtotal in NGN for a given discount.
+ * Calculate the eligible subtotal in NGN for a given discount: what's left of
+ * each eligible line after its volume discount, so a code never discounts
+ * money a volume tier already took off.
  */
 export function getEligibleSubtotalNGN(
   items: CartItemPayload[],
@@ -146,8 +148,49 @@ export function getEligibleSubtotalNGN(
 ): number {
   return items.reduce((sum, item) => {
     if (!isItemEligibleForDiscount(item, discount)) return sum;
-    return sum + item.unit_price_ngn * item.quantity;
+    const line = item.unit_price_ngn * item.quantity;
+    return sum + Math.max(0, line - Math.min(line, Number(item.volume_discount_ngn) || 0));
   }, 0);
+}
+
+// ============================================================
+// VOLUME DISCOUNTS (migration 19). Mirrored in buysub-web/lib/constants.ts:
+// change one, change both.
+// ============================================================
+
+export const MAX_VOLUME_TIERS = 5;
+export const MAX_VOLUME_PERCENT = 90;
+
+/** Clean a product's volume_tiers: whole quantities of 2 or more, percents
+ *  above 0 and at most 90, one tier per quantity, ascending. */
+export function normalizeVolumeTiers(raw: unknown): VolumeTier[] {
+  if (!Array.isArray(raw)) return [];
+  const byQty = new Map<number, number>();
+  for (const t of raw) {
+    const q = Math.floor(Number((t as any)?.min_qty));
+    const pct = Math.round(Number((t as any)?.percent) * 100) / 100;
+    if (!Number.isFinite(q) || q < 2 || q > 1000) continue;
+    if (!Number.isFinite(pct) || pct <= 0 || pct > MAX_VOLUME_PERCENT) continue;
+    byQty.set(q, pct);
+  }
+  return [...byQty.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .slice(0, MAX_VOLUME_TIERS)
+    .map(([min_qty, percent]) => ({ min_qty, percent }));
+}
+
+/** The highest tier a quantity reaches, or null. */
+export function volumeTierFor(tiers: VolumeTier[], quantity: number): VolumeTier | null {
+  let best: VolumeTier | null = null;
+  for (const t of tiers) if (quantity >= t.min_qty && (!best || t.percent > best.percent)) best = t;
+  return best;
+}
+
+/** NGN taken off one line (unit price x quantity) by its volume tier. */
+export function volumeDiscountNGN(unitPriceNGN: number, quantity: number, tiers: VolumeTier[]): number {
+  const tier = volumeTierFor(tiers, quantity);
+  if (!tier) return 0;
+  return Math.round(unitPriceNGN * quantity * (tier.percent / 100) * 100) / 100;
 }
 
 /**

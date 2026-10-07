@@ -33,7 +33,7 @@ The shape matters:
 - `src/shared/discount.ts` — the discount engine. Pure functions, no I/O.
 - `src/shared/types.ts` — DB row and request/response types.
 
-The tables these features use come from `../supabase-migrations/08`–`18`. They are all additive, so apply them **before** deploying this code (the old code ignores them; this code reads them).
+The tables these features use come from `../supabase-migrations/08`–`19` (19: product volume tiers, priced in `prepareOrder` and folded into `orders.discount_ngn`, with `volume_discount_ngn` as the breakdown). They are all additive, so apply them **before** deploying this code (the old code ignores them; this code reads them).
 
 ### Router
 

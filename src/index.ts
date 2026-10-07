@@ -12,6 +12,7 @@ import type {
 } from './shared/types';
 import {
   validateAndCalcDiscount, getEligibleSubtotalNGN, isItemEligibleForDiscount,
+  normalizeVolumeTiers, volumeDiscountNGN,
   calcDiscountNGN, buildDiscountDisplay, splitList, norm,
 } from './shared/discount';
 import {
@@ -578,7 +579,7 @@ const PUBLIC_PRODUCT_COLUMNS = [
   'price_1m', 'price_3m', 'price_6m', 'price_1y', 'billing_type', 'billing_period', 'tags',
   'domain', 'stock_status', 'status', 'image_url', 'sort_order', 'featured', 'updated_at',
   'badge', 'delivery_time', 'delivery_method', 'region', 'features', 'how_it_works', 'faqs',
-  'seo_title', 'seo_description',
+  'seo_title', 'seo_description', 'volume_tiers',
 ].join(',');
 
 async function handleGetProducts(
@@ -748,7 +749,10 @@ type PreparedOrder = {
   email: string;
   items: CartItemPayload[];
   subtotalNGN: number;
+  /** Everything off the subtotal: volume tiers plus the promo code. */
   discountNGN: number;
+  /** The volume-tier part of discountNGN (migration 19). */
+  volumeNGN: number;
   discountCode: string | null;
   affiliateId: string | null;
   referralCode: string | null;
@@ -778,6 +782,8 @@ async function prepareOrder(
   const productMap = new Map(products.map((p: any) => [p.id, p]));
   const items: CartItemPayload[] = [];
   let subtotalNGN = 0;
+  // Volume tiers (migration 19), applied per line before any promo code.
+  let volumeNGN = 0;
 
   for (const raw of body.items) {
     const product: any = productMap.get(raw?.product_id);
@@ -799,6 +805,7 @@ async function prepareOrder(
       return fail(`Price for ${product.name} has changed. Refresh the page to see the current price.`);
     }
 
+    const volume = volumeDiscountNGN(dbPrice, quantity, normalizeVolumeTiers(product.volume_tiers));
     items.push({
       product_id: product.id,
       product_name: product.name,
@@ -808,8 +815,10 @@ async function prepareOrder(
       duration_months: period.months,
       unit_price_ngn: dbPrice,
       quantity,
+      volume_discount_ngn: volume,
     });
     subtotalNGN += dbPrice * quantity;
+    volumeNGN += volume;
   }
 
   // ── Discount (server-side, authoritative) ──
@@ -871,7 +880,12 @@ async function prepareOrder(
 
   return {
     ok: true,
-    order: { email, items, subtotalNGN, discountNGN, discountCode, affiliateId, referralCode, referrerUserId, currency, fxRate: currency === 'NGN' ? 1 : fxRate },
+    order: {
+      email, items, subtotalNGN,
+      discountNGN: Math.min(subtotalNGN, Math.round((volumeNGN + discountNGN) * 100) / 100),
+      volumeNGN, discountCode, affiliateId, referralCode, referrerUserId, currency,
+      fxRate: currency === 'NGN' ? 1 : fxRate,
+    },
   };
 }
 
@@ -911,6 +925,9 @@ async function insertOrderWithItems(
     discount_code: prepared.discountCode,
     affiliate_id: prepared.affiliateId,
     referral_code: prepared.referralCode,
+    // Only sent when a tier applied: products have no tiers before migration
+    // 19, so orders keep saving without the column.
+    ...(prepared.volumeNGN > 0 ? { volume_discount_ngn: prepared.volumeNGN } : {}),
     // Only sent when set, so orders still save before migration 12.
     ...(prepared.referrerUserId ? { referrer_user_id: prepared.referrerUserId } : {}),
   }).select().single();
@@ -928,6 +945,8 @@ async function insertOrderWithItems(
     unit_price_ngn: item.unit_price_ngn,
     quantity: item.quantity,
     total_price_ngn: item.unit_price_ngn * item.quantity,
+    // Same key on every row of the batch insert, and only when a tier applied.
+    ...(prepared.volumeNGN > 0 ? { volume_discount_ngn: item.volume_discount_ngn || 0 } : {}),
   })));
 
   if (iErr) {
@@ -1878,7 +1897,7 @@ function buildOrderEmailHtml(
  
   const discountRow = order.discount_ngn > 0 ? `
     <tr>
-      <td style="padding:6px 0;color:#a0a0b0;font-size:13px;">Discount${order.discount_code ? ` (${escHtml(order.discount_code)})` : ''}</td>
+      <td style="padding:6px 0;color:#a0a0b0;font-size:13px;">Discount${order.discount_code && !(Number(order.volume_discount_ngn) > 0) ? ` (${escHtml(order.discount_code)})` : ''}</td>
       <td style="padding:6px 0;color:#22c55e;font-size:13px;text-align:right;">-${fmt(order.discount_ngn)}</td>
     </tr>` : '';
  
@@ -2055,7 +2074,7 @@ const PRODUCT_WRITE_FIELDS = [
   'domain', 'billing_type', 'billing_period', 'featured', 'sort_order', 'image_url',
   'whatsapp_group_url', 'social_links',
   'badge', 'delivery_time', 'delivery_method', 'region', 'seo_title', 'seo_description',
-  'features', 'how_it_works', 'faqs',
+  'features', 'how_it_works', 'faqs', 'volume_tiers',
 ];
 
 function pickProductFields(body: any): { ok: true; fields: Record<string, any> } | { ok: false; error: string } {
@@ -2076,6 +2095,10 @@ function pickProductFields(body: any): { ok: true; fields: Record<string, any> }
       .map((f: any) => ({ q: String(f?.q ?? '').trim(), a: String(f?.a ?? '').trim() }))
       .filter((f: { q: string; a: string }) => f.q && f.a)
       .slice(0, 30);
+  }
+  if (fields.volume_tiers !== undefined) {
+    if (fields.volume_tiers !== null && !Array.isArray(fields.volume_tiers)) return { ok: false, error: 'volume_tiers must be a list' };
+    fields.volume_tiers = normalizeVolumeTiers(fields.volume_tiers);
   }
   for (const key of ['badge', 'delivery_time', 'delivery_method', 'region', 'seo_title', 'seo_description']) {
     if (typeof fields[key] === 'string') fields[key] = fields[key].trim() || null;
@@ -4593,7 +4616,9 @@ async function buildReceiptPdf(order: any): Promise<Uint8Array> {
   if (hasDiscount) {
     totRow('Subtotal', fmtNGN(order.subtotal_ngn || 0));
     totRow(
-      `Discount${order.discount_code ? ' (' + order.discount_code + ')' : ''}`,
+      // discount_ngn includes any volume discount (migration 19), so name the
+      // code only when it is the whole amount.
+      `Discount${order.discount_code && !(Number(order.volume_discount_ngn) > 0) ? ' (' + order.discount_code + ')' : ''}`,
       '-' + fmtNGN(order.discount_ngn),
       false, true,
     );

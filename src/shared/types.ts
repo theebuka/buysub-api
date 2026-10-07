@@ -49,11 +49,15 @@ export interface Product {
   features?: string[];
   how_it_works?: string[];
   faqs?: { q: string; a: string }[];
+  /** Quantity tiers, e.g. [{ min_qty: 3, percent: 5 }] (migration 19). */
+  volume_tiers?: VolumeTier[];
   seo_title?: string | null;
   seo_description?: string | null;
 }
 
 // ── Cart (frontend → API) ──
+export interface VolumeTier { min_qty: number; percent: number }
+
 export interface CartItemPayload {
   product_id: string;
   product_name: string;
@@ -63,6 +67,8 @@ export interface CartItemPayload {
   duration_months: number | null;  // null for One-time
   unit_price_ngn: number;
   quantity: number;
+  /** Taken off this line by the product's volume tiers (migration 19). */
+  volume_discount_ngn?: number;
 }
 
 // ── Orders ──
