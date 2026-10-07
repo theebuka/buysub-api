@@ -61,3 +61,19 @@ export async function handlePutCart(db: SupabaseClient, request: Request, env: E
   if (error) return unavailable(request, env, error.message);
   return ok({ items: data.items, updated_at: data.updated_at }, request, env);
 }
+
+/**
+ * Empties the account cart of the customer who placed `order`, once it's paid,
+ * unless the cart was changed after the order was placed (they've started
+ * another one). Best effort: the web app also clears its copy.
+ */
+export async function clearCartForPaidOrder(db: SupabaseClient, order: { customer_id?: string | null; created_at?: string | null }): Promise<void> {
+  try {
+    if (!order.customer_id || !order.created_at) return;
+    const { data: customer } = await db.from('customers').select('user_id').eq('id', order.customer_id).maybeSingle();
+    if (!customer?.user_id) return;
+    await db.from('carts').delete().eq('user_id', customer.user_id).lte('updated_at', order.created_at);
+  } catch (e: any) {
+    console.error('clearCartForPaidOrder:', e?.message);
+  }
+}

@@ -36,7 +36,7 @@ import {
   commissionRate, tierInfo,
 } from './features/payouts';
 import { handleMySaved, handleSaveProduct, handleMergeSaved } from './features/saved';
-import { handleMyCart, handlePutCart } from './features/cart';
+import { handleMyCart, handlePutCart, clearCartForPaidOrder } from './features/cart';
 import {
   handleMySupportThreads, handleCreateSupportThread, handleMySupportThread, handleMySupportReply, handleMySupportClose,
   handleAdminSupportThreads, handleAdminSupportThread, handleAdminSupportReply, handleAdminSupportUpdate, supportWaitingCount,
@@ -493,6 +493,7 @@ export default {
       if (path === '/v2/me'                    && method === 'PATCH') return handleUpdateMe(db, request, env)
       if (path === '/v2/me/orders'             && method === 'GET')   return handleGetMyOrders(db, request, env)
       if (path.match(/^\/v2\/me\/orders\/[^/]+$/) && method === 'GET') return handleGetMyOrder(db, decodeURIComponent(path.split('/').pop() || ''), request, env)
+      if (path.match(/^\/v2\/me\/orders\/[^/]+\/confirmation$/) && method === 'GET') return handleMyOrderConfirmation(db, decodeURIComponent(path.split('/')[4] || ''), request, env)
       if (path === '/v2/me/wallet'             && method === 'GET')   return handleGetMyWallet(db, request, env)
       if (path === '/v2/me/wallet/transactions'&& method === 'GET')   return handleGetMyWalletTxns(db, request, env)
       if (path === '/v2/me/messages'           && method === 'GET')   return handleGetMyMessages(db, request, env)
@@ -1263,6 +1264,7 @@ async function handlePaystackInit(
   // If fully paid by wallet
   if (amountToCharge <= 0) {
     await fulfillOrder(db, order.id, 'wallet', env, ['pending']);
+    await clearCartForPaidOrder(db, order);
     return ok({
       fully_paid_by_wallet: true,
       order_ref: order.order_ref,
@@ -1431,6 +1433,7 @@ async function handlePaystackVerify(
   if (settled === 'mismatch') {
     return err('Payment amount does not match the order. Contact support with your reference.', 409, request, env);
   }
+  await clearCartForPaidOrder(db, order);
 
   return ok({
     verified: true,
@@ -2930,7 +2933,7 @@ async function handleAdminWallets(
 
     if (dbErr) return err(dbErr.message, 500, request, env);
 
-    return ok(data || [], request, env, {
+    return ok(await withWalletPeople(db, data || []), request, env, {
       pagination: { page, limit, total: count || 0, pages: Math.ceil((count || 0) / limit) }
     });
   } catch (e: any) {
@@ -2941,6 +2944,51 @@ async function handleAdminWallets(
   }
 }
 
+
+// Names the wallet's owner (customer_name/_email) and, for staff changes, who
+// made it (actor_name/_email; actor_id exists from migration 22). Best effort.
+async function withWalletPeople(db: SupabaseClient, rows: any[]): Promise<any[]> {
+  if (!rows.length) return rows;
+  try {
+    const walletIds = [...new Set(rows.map(r => r.wallet_id).filter(Boolean))];
+    const { data: wallets } = await db.from('wallets').select('id, user_id').in('id', walletIds);
+    const ownerOf = new Map((wallets || []).map((w: any) => [w.id, w.user_id]));
+    const userIds = [...new Set([...ownerOf.values(), ...rows.map(r => r.actor_id)].filter(Boolean))];
+    const [{ data: profiles }, { data: customers }] = await Promise.all([
+      db.from('profiles').select('id, full_name, email').in('id', userIds),
+      db.from('customers').select('user_id, name, email').in('user_id', userIds),
+    ]);
+    const person = new Map<string, { name: string | null; email: string | null }>();
+    for (const c of customers || []) person.set(c.user_id, { name: c.name || null, email: c.email || null });
+    for (const p of profiles || []) {
+      const c = person.get(p.id);
+      person.set(p.id, { name: p.full_name || c?.name || null, email: p.email || c?.email || null });
+    }
+    return rows.map(r => {
+      const owner = person.get(ownerOf.get(r.wallet_id) as string);
+      const actor = r.actor_id ? person.get(r.actor_id) : undefined;
+      return {
+        ...r,
+        customer_name: owner?.name ?? null,
+        customer_email: owner?.email ?? null,
+        actor_name: actor?.name ?? null,
+        actor_email: actor?.email ?? null,
+      };
+    });
+  } catch (e: any) {
+    console.error('withWalletPeople:', e?.message);
+    return rows;
+  }
+}
+
+// credit_wallet / debit_wallet with the staff member who made the change.
+// Before migration 22 (or after its rollback) the functions don't take
+// p_actor / p_source; retry without them so admin changes still work.
+async function walletRpc(db: SupabaseClient, fn: 'credit_wallet' | 'debit_wallet', args: Record<string, any>, extra: Record<string, any>) {
+  const first = await db.rpc(fn, { ...args, ...extra });
+  if (first.error?.code === 'PGRST202') return db.rpc(fn, args);
+  return first;
+}
 
 async function handleValidateDiscountV2(
   db: SupabaseClient, url: URL, request: Request, env: Env
@@ -4271,6 +4319,27 @@ async function handleGetMyOrder(db: any, ref: string, request: Request, env: any
   return ok(data[0], request, env)
 }
 
+// ── GET /v2/me/orders/:ref/confirmation ──────────────────────────
+// The confirmation page for an order Paystack never saw (paid in full from
+// the wallet). Same shape as /v2/pay/verify, but for the order's owner only.
+async function handleMyOrderConfirmation(db: any, ref: string, request: Request, env: any): Promise<Response> {
+  const auth = await requireAuth(db, request, env)
+  if (!auth.ok) return auth.response
+  const email = await myEmail(db, auth)
+  const { data } = await db.from('orders').select('*')
+    .ilike('customer_email', escapeLike(email)).eq('order_ref', ref).limit(1)
+  const order = data?.[0]
+  if (!order) return err('Order not found', 404, request, env)
+  if (order.status !== 'paid') return err('This order isn’t paid yet.', 409, request, env)
+  return ok({
+    verified: true,
+    order_ref: order.order_ref,
+    status: order.status,
+    amount_ngn: Number(order.total_ngn) || 0,
+    summary: await verifySummary(db, order),
+  }, request, env)
+}
+
 // ── GET /v2/me/wallet ────────────────────────────────────────────
 async function handleGetMyWallet(db: any, request: Request, env: any): Promise<Response> {
   const auth = await requireAuth(db, request, env)
@@ -4427,12 +4496,12 @@ async function handleAdminWalletTopup(db: any, request: Request, env: any): Prom
     compensation: 'admin',
   }
   
-  const { error: rpcError } = await db.rpc('credit_wallet', {
+  const { error: rpcError } = await walletRpc(db, 'credit_wallet', {
     p_wallet_id: wallet[0].id,
     p_amount: Number(body.amount_ngn),
     p_reference: body.reference || body.source || 'admin topup',
     p_source: sourceMap[body.source] || 'admin',
-  })
+  }, { p_actor: auth.userId })
   
   if (rpcError) return err(rpcError.message, 500, request, env)
  
@@ -4484,13 +4553,14 @@ async function handleAdminWalletDebit(db: any, request: Request, env: any) {
 
   if (!wallet) return err('Wallet not found', 404, request, env)
 
-  const { error } = await db.rpc('debit_wallet', {
+  const { error } = await walletRpc(db, 'debit_wallet', {
     p_wallet_id: wallet.id,
     p_amount: Number(amount),
     p_reference: reference || 'admin debit',
-  })
+  }, { p_actor: auth.userId, p_source: 'admin' })
 
   if (error) return err(error.message, 500, request, env)
+  await logEvent(db, 'wallet', wallet.id, 'debit', auth.userId, { amount_ngn: Number(amount), customer_id })
 
   return ok({ success: true }, request, env)
 }
