@@ -2065,7 +2065,7 @@ function buildOrderEmailHtml(
    ══════════════════════════════════════════════════════════════════ */
  
 async function sendPartnerSignupEmail(
-  args: { to: string; ownerName: string; storeName: string; verifyUrl: string | null },
+  args: { to: string; ownerName: string; storeName: string; verifyUrl: string | null; existingAccount?: boolean },
   env: Env
 ): Promise<Response> {
   const html = `<!DOCTYPE html>
@@ -2087,13 +2087,15 @@ async function sendPartnerSignupEmail(
               Our team will review your application within <strong style="color:#e8e8ec;">3–5 business days</strong> and get back to you via your preferred contact method.
             </p>
             <p style="margin:0 0 24px;color:#a0a0b0;font-size:14px;line-height:1.7;">
-              ${args.verifyUrl
-                ? 'First, confirm this is your email address. We can only review applications with a verified email, and you can\'t sign in until it\'s done.'
-                : 'Before you can sign in, verify your email: on the login page, try to sign in and choose “Resend verification email”.'}
-              Once approved, you can log in to your partner dashboard to view affiliate stats, track earnings, and manage your profile.
+              ${args.existingAccount
+                ? 'You applied with your BuySub account, so there\'s nothing to set up. Once approved, the partner portal opens from your account menu, with your referral link, earnings and payout settings.'
+                : `${args.verifyUrl
+                  ? 'First, confirm this is your email address. We can only review applications with a verified email, and you can\'t sign in until it\'s done.'
+                  : 'Before you can sign in, verify your email: on the login page, try to sign in and choose “Resend verification email”.'}
+              Once approved, you can log in to your partner dashboard to view affiliate stats, track earnings, and manage your profile.`}
             </p>
             <div style="text-align:center;margin:24px 0 8px;">
-              <a href="${escHtml(args.verifyUrl || 'https://app.buysub.ng/login')}" style="display:inline-block;padding:14px 28px;border-radius:10px;background:#7C5CFF;color:#fff;font-size:14px;font-weight:600;text-decoration:none;box-shadow:0 6px 20px rgba(124,92,255,0.35);">${args.verifyUrl ? 'Verify my email' : 'Go to login'}</a>
+              <a href="${escHtml(args.existingAccount ? `${env.FRONTEND_URL || 'https://app.buysub.ng'}/partner` : args.verifyUrl || 'https://app.buysub.ng/login')}" style="display:inline-block;padding:14px 28px;border-radius:10px;background:#7C5CFF;color:#fff;font-size:14px;font-weight:600;text-decoration:none;box-shadow:0 6px 20px rgba(124,92,255,0.35);">${args.existingAccount ? 'See your application' : args.verifyUrl ? 'Verify my email' : 'Go to login'}</a>
             </div>
           </td></tr>
           <tr><td style="padding:20px 32px 32px;border-top:1px solid #1c1c22;">
@@ -2517,12 +2519,29 @@ async function handleSubmitPartnerApplication(
   // in the partner portal; payouts wait until payout details and the AML
   // declaration are in (features/payouts.ts). The old 4-step form still sends
   // everything, and that's still accepted.
-  const required = ['store_name', 'owner_name', 'owner_email', 'owner_phone', 'password'];
+  //
+  // Signed in (an Authorization header): the application goes on that account.
+  // No new login, no password, and the email is the account's own (already
+  // verified, since unverified accounts can't sign in). One application per
+  // account (unique index on user_id).
+  let signedIn: { userId: string; email: string } | null = null;
+  if (request.headers.get('Authorization')) {
+    const a = await requireAuth(db, request, env);
+    if (!a.ok) return a.response;
+    if (!a.email) return err('Your account has no email address. Contact support to apply.', 400, request, env);
+    signedIn = { userId: a.userId, email: a.email };
+    const { data: already } = await db.from('partner_applications').select('id').eq('user_id', a.userId).maybeSingle();
+    if (already) return err('You’ve already applied with this account. See its status in the partner portal.', 409, request, env);
+  }
+
+  const required = signedIn
+    ? ['store_name', 'owner_name', 'owner_phone']
+    : ['store_name', 'owner_name', 'owner_email', 'owner_phone', 'password'];
   for (const field of required) {
     if (!body[field]) return err(`Missing required field: ${field}`, 400, request, env);
   }
  
-  if (typeof body.password !== 'string' || body.password.length < 8) {
+  if (!signedIn && (typeof body.password !== 'string' || body.password.length < 8)) {
     return err('Password must be at least 8 characters', 400, request, env);
   }
  
@@ -2542,26 +2561,31 @@ async function handleSubmitPartnerApplication(
   // so anyone could create a working account for an email they don't own.
   // The applicant verifies through the link in the welcome email below; until
   // then they can't sign in and an admin can't approve the application.
-  const ownerEmail = String(body.owner_email).trim().toLowerCase();
-  const { data: signUp, error: signUpErr } = await db.auth.admin.createUser({
-    email: ownerEmail,
-    password: body.password,
-    email_confirm: false,
-    user_metadata: {
-      full_name: body.owner_name,
-      role: 'partner_applicant',
-    },
-  });
- 
-  if (signUpErr || !signUp?.user) {
-    const msg = signUpErr?.message || 'Could not create account';
-    if (/already|exists|registered/i.test(msg)) {
-      return err('An account already exists for this email. Please log in.', 409, request, env);
+  const ownerEmail = (signedIn ? signedIn.email : String(body.owner_email)).trim().toLowerCase();
+  let userId: string;
+  if (signedIn) {
+    userId = signedIn.userId;
+  } else {
+    const { data: signUp, error: signUpErr } = await db.auth.admin.createUser({
+      email: ownerEmail,
+      password: body.password,
+      email_confirm: false,
+      user_metadata: {
+        full_name: body.owner_name,
+        role: 'partner_applicant',
+      },
+    });
+
+    if (signUpErr || !signUp?.user) {
+      const msg = signUpErr?.message || 'Could not create account';
+      if (/already|exists|registered/i.test(msg)) {
+        // The web form offers "sign in to apply with it" on a signed-out 409.
+        return err('An account already exists for this email. Sign in to apply with it.', 409, request, env);
+      }
+      return err(msg, 500, request, env);
     }
-    return err(msg, 500, request, env);
+    userId = signUp.user.id;
   }
- 
-  const userId = signUp.user.id;
  
   const { data, error: dbErr } = await db
     .from('partner_applications')
@@ -2601,8 +2625,9 @@ async function handleSubmitPartnerApplication(
     .single();
  
   if (dbErr) {
-    // Roll back the auth user we just created
-    try { await db.auth.admin.deleteUser(userId); } catch { /* ignore */ }
+    // Roll back the auth user we just created (never an existing account).
+    if (!signedIn) { try { await db.auth.admin.deleteUser(userId); } catch { /* ignore */ } }
+    if (dbErr.code === '23505') return err('You’ve already applied with this account. See its status in the partner portal.', 409, request, env);
     return err(dbErr.message, 500, request, env);
   }
  
@@ -2611,13 +2636,15 @@ async function handleSubmitPartnerApplication(
   });
  
   // Verification link, sent from our own domain via Resend. Verifying a magic
-  // link confirms the email and signs them in, landing on the partner dashboard.
+  // link confirms the email and signs them in, landing in the partner portal.
+  // /partner must be on the Supabase Auth redirect allow-list, or Supabase
+  // falls back to the Site URL. A signed-in applicant is already verified.
   let verifyUrl: string | null = null;
-  try {
+  if (!signedIn) try {
     const { data: link, error: linkErr } = await db.auth.admin.generateLink({
       type: 'magiclink',
       email: ownerEmail,
-      options: { redirectTo: `${env.FRONTEND_URL || 'https://app.buysub.ng'}/partners/dashboard` },
+      options: { redirectTo: `${env.FRONTEND_URL || 'https://app.buysub.ng'}/partner` },
     });
     if (linkErr) console.error('partner verify link failed:', linkErr.message);
     verifyUrl = link?.properties?.action_link ?? null;
@@ -2632,6 +2659,7 @@ async function handleSubmitPartnerApplication(
       ownerName: body.owner_name,
       storeName: body.store_name,
       verifyUrl,
+      existingAccount: !!signedIn,
     }, env);
     emailSent = res.ok && !!verifyUrl;
   } catch (e) {
@@ -2639,7 +2667,7 @@ async function handleSubmitPartnerApplication(
   }
  
   return jsonResponse(
-    { ok: true, data: { id: data.id, status: data.status, user_id: userId, verification_email_sent: emailSent } },
+    { ok: true, data: { id: data.id, status: data.status, user_id: userId, verification_email_sent: emailSent, existing_account: !!signedIn } },
     201, request, env
   );
 }
