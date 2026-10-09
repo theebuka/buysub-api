@@ -2512,12 +2512,12 @@ async function handleSubmitPartnerApplication(
   const body = await request.json().catch(() => null) as any;
   if (!body) return err('Invalid request body', 400, request, env);
  
-  const required = [
-    'legal_name', 'store_name', 'address', 'lga', 'state',
-    'business_phone', 'business_email', 'owner_name', 'owner_email',
-    'owner_phone', 'payout_frequency', 'payout_method',
-    'password',
-  ];
+  // The short form (migration 23) asks for the store, the owner and where they
+  // sell. Business address and contact, CAC details and payout setup are added
+  // in the partner portal; payouts wait until payout details and the AML
+  // declaration are in (features/payouts.ts). The old 4-step form still sends
+  // everything, and that's still accepted.
+  const required = ['store_name', 'owner_name', 'owner_email', 'owner_phone', 'password'];
   for (const field of required) {
     if (!body[field]) return err(`Missing required field: ${field}`, 400, request, env);
   }
@@ -2526,16 +2526,16 @@ async function handleSubmitPartnerApplication(
     return err('Password must be at least 8 characters', 400, request, env);
   }
  
-  if (body.payout_method === 'Bank Transfer') {
+  if (body.payout_method === 'Bank Transfer' && (body.bank_name || body.account_name || body.account_number)) {
     if (!body.bank_name || !body.account_name || !body.account_number)
       return err('Bank details required for Bank Transfer', 400, request, env);
   }
-  if (body.payout_method === 'Crypto') {
+  if (body.payout_method === 'Crypto' && (body.crypto_token || body.crypto_chain || body.wallet_address)) {
     if (!body.crypto_token || !body.crypto_chain || !body.wallet_address)
       return err('Crypto details required for Crypto payout', 400, request, env);
   }
-  if (!body.aml_accepted || !body.privacy_accepted || !body.terms_accepted) {
-    return err('All compliance checkboxes must be accepted', 400, request, env);
+  if (!body.privacy_accepted || !body.terms_accepted) {
+    return err('Accept the partner terms and the privacy policy to apply', 400, request, env);
   }
  
   // Create the auth user UNCONFIRMED. This used to pass email_confirm: true,
@@ -2567,14 +2567,14 @@ async function handleSubmitPartnerApplication(
     .from('partner_applications')
     .insert({
       user_id: userId,
-      legal_name: body.legal_name,
+      legal_name: body.legal_name || null,
       store_name: body.store_name,
-      address: body.address,
-      lga: body.lga,
-      state: body.state,
-      business_phone: body.business_phone,
+      address: body.address || null,
+      lga: body.lga || null,
+      state: body.state || null,
+      business_phone: body.business_phone || null,
       alternate_phone: body.alternate_phone || null,
-      business_email: body.business_email,
+      business_email: body.business_email || null,
       cac_number: body.cac_number || null,
       registration_year: body.registration_year || null,
       social_media: body.social_media || null,
@@ -2584,15 +2584,15 @@ async function handleSubmitPartnerApplication(
       gender: body.gender || null,
       owner_location: body.owner_location || null,
       contact_method: body.contact_method || null,
-      payout_frequency: body.payout_frequency,
-      payout_method: body.payout_method,
+      payout_frequency: body.payout_frequency || null,
+      payout_method: body.payout_method || null,
       bank_name: body.bank_name || null,
       account_name: body.account_name || null,
       account_number: body.account_number || null,
       crypto_token: body.crypto_token || null,
       crypto_chain: body.crypto_chain || null,
       wallet_address: body.wallet_address || null,
-      aml_accepted: body.aml_accepted,
+      aml_accepted: !!body.aml_accepted,
       privacy_accepted: body.privacy_accepted,
       terms_accepted: body.terms_accepted,
       status: 'pending_review',
@@ -2607,8 +2607,7 @@ async function handleSubmitPartnerApplication(
   }
  
   await logEvent(db, 'partner_application', data.id, 'submitted', userId, {
-    legal_name: body.legal_name,
-    business_email: body.business_email,
+    store_name: body.store_name,
   });
  
   // Verification link, sent from our own domain via Resend. Verifying a magic
@@ -2850,6 +2849,29 @@ async function handlePartnerUpdateMe(
   for (const k of allowed) {
     if (body[k] !== undefined) updates[k] = body[k];
   }
+  // The AML declaration can be given here (it gates payouts) but not withdrawn.
+  if (body.aml_accepted === true) updates.aml_accepted = true;
+  // Registered-business details: the partner can fill them in once. Changing
+  // them after that needs a review, so it goes through support.
+  const fillOnce = ['legal_name', 'cac_number', 'registration_year'];
+  if (fillOnce.some(k => body[k] !== undefined && body[k] !== null && body[k] !== '')) {
+    const { data: cur } = await db.from('partner_applications')
+      .select('legal_name, cac_number, registration_year').eq('user_id', user.id).maybeSingle();
+    for (const k of fillOnce) {
+      const v = body[k];
+      if (v === undefined || v === null || v === '') continue;
+      const was = (cur as any)?.[k];
+      if (was && String(was) === String(v).trim()) continue;
+      if (was) return err('Contact support to change your registered business details', 409, request, env);
+      if (k === 'registration_year') {
+        const y = parseInt(String(v), 10);
+        if (!(y >= 1900 && y <= new Date().getFullYear())) return err('Enter a valid registration year', 400, request, env);
+        updates[k] = y;
+      } else {
+        updates[k] = String(v).trim().slice(0, 200);
+      }
+    }
+  }
   if (Object.keys(updates).length === 0) {
     return err('No updatable fields provided', 400, request, env);
   }
@@ -2863,6 +2885,12 @@ async function handlePartnerUpdateMe(
     .single();
  
   if (dbErr) return err(dbErr.message, 500, request, env);
+  // Approval copied legal_name to the affiliate as business_name; a partner who
+  // adds it later gets it copied too.
+  if (updates.legal_name) {
+    await db.from('affiliates').update({ business_name: updates.legal_name })
+      .eq('user_id', user.id).is('business_name', null);
+  }
   return ok(data, request, env);
 }
  

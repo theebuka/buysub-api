@@ -14,6 +14,10 @@
 // Tiers: feature_flags.partner_tiers lists tiers by lifetime referred sales
 // (paid orders, after discount). When on, a new commission uses the higher of
 // the partner's own rate and their tier's rate (commissionRate).
+//
+// Setup: a partner who applied through the short form (migration 23) adds
+// payout details and the AML declaration in the portal. Until both are in, the
+// run skips them and their commissions roll into the next period.
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { type Env, ok, err, requireAuth, requireAdmin, logEvent } from '../http';
@@ -140,29 +144,65 @@ function cutoffFor(periodEnd: string, holdDays: number): Date {
 // catches up within this window).
 const CATCH_UP_DAYS = 10;
 
-async function frequencyByUser(db: SupabaseClient, userIds: string[]): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
+type Setup = { frequency: string; ready: boolean };
+type AppPayout = { payout_method?: string | null; bank_name?: string | null; account_number?: string | null; wallet_address?: string | null; aml_accepted?: boolean | null } | null | undefined;
+type AffBank = { bank_name?: string | null; account_number?: string | null } | null | undefined;
+
+/** Where to send the money is known: a bank account (the application's, else the affiliate's) or a crypto wallet. */
+export function hasPayoutDetails(app: AppPayout, aff: AffBank): boolean {
+  const bank = !!((app?.bank_name || aff?.bank_name) && (app?.account_number || aff?.account_number));
+  const crypto = !!app?.wallet_address;
+  return app?.payout_method === 'Crypto' ? crypto : bank || crypto;
+}
+
+/** Payout details plus the AML declaration: what a partner needs before any payout. */
+export function payoutReady(app: AppPayout, aff: AffBank): boolean {
+  return hasPayoutDetails(app, aff) && !!app?.aml_accepted;
+}
+
+async function setupByUser(db: SupabaseClient, affs: { user_id: string; bank_name?: string | null; account_number?: string | null }[]): Promise<Map<string, Setup>> {
+  const out = new Map<string, Setup>();
+  const userIds = affs.map(a => a.user_id).filter(Boolean);
   if (!userIds.length) return out;
-  const { data } = await db.from('partner_applications').select('user_id, payout_frequency, created_at')
+  const { data } = await db.from('partner_applications')
+    .select('user_id, payout_frequency, payout_method, bank_name, account_number, wallet_address, aml_accepted, created_at')
     .in('user_id', userIds).order('created_at', { ascending: true });
-  for (const r of data || []) if (r.user_id) out.set(r.user_id, normalFrequency(r.payout_frequency));
+  const affByUser = new Map(affs.map(a => [a.user_id, a]));
+  for (const r of data || []) {
+    if (r.user_id) out.set(r.user_id, { frequency: normalFrequency(r.payout_frequency), ready: payoutReady(r, affByUser.get(r.user_id)) });
+  }
   return out;
 }
 
 export async function runPartnerPayouts(db: SupabaseClient, env: Env, at = new Date()) {
-  const result = { created: 0, below_minimum: 0, exists: 0, not_due: 0, failed: 0 };
+  const result = { created: 0, below_minimum: 0, exists: 0, not_due: 0, needs_setup: 0, failed: 0 };
   const flags = await getFlags(db, true);
   const terms = payoutTerms(flags);
   if (!terms.enabled) return result;
 
-  const { data: affs, error } = await db.from('affiliates').select('id, user_id').eq('status', 'approved').limit(5000);
+  const { data: affs, error } = await db.from('affiliates').select('id, user_id, bank_name, account_number').eq('status', 'approved').limit(5000);
   if (error) { console.error('partner payouts:', error.message); return result; }
-  const freq = await frequencyByUser(db, (affs || []).map(a => a.user_id).filter(Boolean));
+  const setup = await setupByUser(db, affs || []);
 
   for (const a of affs || []) {
-    const frequency = freq.get(a.user_id) ?? 'Monthly';
+    const frequency = setup.get(a.user_id)?.frequency ?? 'Monthly';
     const p = payoutPeriods(frequency, at);
     if (at.getTime() - Date.parse(p.last_end + 'T00:00:00Z') + LAGOS_OFFSET_MS > CATCH_UP_DAYS * 86_400_000) { result.not_due++; continue; }
+    if (!setup.get(a.user_id)?.ready) {
+      // Hold, don't pay: nowhere to send it yet. Tell them once per period, and
+      // only if there's commission waiting.
+      result.needs_setup++;
+      const { count } = await db.from('affiliate_commissions').select('id', { count: 'exact', head: true })
+        .eq('affiliate_id', a.id).is('payout_id', null).in('status', ['pending', 'approved']);
+      if (count) {
+        await notifyUser(db, a.user_id, {
+          kind: 'payout', title: 'Add your payout details to get paid',
+          body: 'You have commission waiting. Add where we should send it in your partner profile, and we’ll include it in your next payout.',
+          href: '/partner/profile#payout', dedupe: `payout-setup:${a.id}:${p.last_end}`,
+        });
+      }
+      continue;
+    }
     const { data, error: rpcErr } = await db.rpc('create_partner_payout', {
       p_affiliate_id: a.id, p_period_start: p.last_start, p_period_end: p.last_end, p_frequency: frequency,
       p_hold_days: terms.hold_days, p_min_ngn: terms.min_ngn,
@@ -205,7 +245,7 @@ export async function handleMyPayouts(db: SupabaseClient, request: Request, env:
       .select('id, amount_ngn, status, period_start, period_end, frequency, created_at, processed_at, admin_note, reference')
       .eq('affiliate_id', aff.id).order('created_at', { ascending: false }).limit(50),
     db.from('partner_applications')
-      .select('payout_frequency, payout_method, bank_name, account_number, wallet_address')
+      .select('payout_frequency, payout_method, bank_name, account_number, wallet_address, aml_accepted')
       .eq('user_id', auth.userId).order('created_at', { ascending: false }).limit(1).maybeSingle(),
   ]);
 
@@ -218,7 +258,7 @@ export async function handleMyPayouts(db: SupabaseClient, request: Request, env:
     if (new Date((c as any).created_at).getTime() < cutoff) next += amt; else later += amt;
   }
   const d = app.data;
-  const hasDetails = !!((d?.bank_name || aff.bank_name) && (d?.account_number || aff.account_number)) || !!d?.wallet_address;
+  const hasDetails = hasPayoutDetails(d, aff);
   const rows = history.error ? [] : history.data || [];
   const round = (n: number) => Math.round(n * 100) / 100;
   return ok({
@@ -230,6 +270,8 @@ export async function handleMyPayouts(db: SupabaseClient, request: Request, env:
     next_ngn: round(next),
     later_ngn: round(later),
     has_details: hasDetails,
+    aml_accepted: !!d?.aml_accepted,
+    setup_complete: hasDetails && !!d?.aml_accepted,
     open: rows.filter(r => r.status === 'pending'),
     history: rows,
   }, request, env);
