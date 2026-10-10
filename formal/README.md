@@ -107,6 +107,11 @@ Each `Fix*` constant in `Checkout.tla` is one of these changes. The `All_fixed*`
 - 33 scenario checks passed: wallet apply, cancel, reserve, record, and the constraints.
 - `test/fakeDb.ts` implements the same four functions for the unit tests.
 
+Two gaps remain open, both logged in [`../KNOWN_ISSUES.md`](../KNOWN_ISSUES.md):
+
+- Double payments are logged but not refunded or surfaced.
+- Wallet money stays held on abandoned orders until they're cancelled.
+
 ## Limits
 
 - **Bounded checks.** TLC checks small instances: one order, 2–3 attempts, a few admin actions, and amounts of 10 and 4 (or 12). The Lean proofs cover all integers but abstract away the 2-decimal rounding and the fx rate.
