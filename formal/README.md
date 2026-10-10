@@ -1,6 +1,8 @@
 # Formal models
 
-These are models of the money paths in `src/index.ts`, checked with TLC (TLA+) and Lean 4. Every bug they found has a reproduction in `test/*.bugs.test.ts`, which runs the real Worker against an in-memory Supabase (`test/fakeDb.ts`) and a fake Paystack.
+These are models of the money paths in `src/index.ts`, checked with TLC (TLA+) and Lean 4.
+
+The eight bugs they found are fixed by `../supabase-migrations/24_order_money_atomic.sql` and the API code that calls it. `test/*.bugs.test.ts` replays each counterexample against the real Worker, using an in-memory Supabase (`test/fakeDb.ts`) and a fake Paystack, and asserts the fixed outcome.
 
 ```bash
 ./formal/check.sh   # every TLC model + the Lean proofs; exit 0 = all results as expected
@@ -33,18 +35,18 @@ Each property is checked only when no request is mid-flight and every captured p
 | P4 `NoSilentOvercharge` | Paying more than the price is always logged. |
 | P5 `NoHonestMismatch` | Paying exactly what the Paystack page showed never gets "amount does not match", unless an admin cancelled the order. |
 
-## Findings
+## Findings (all fixed)
 
-| # | Bug | Found by | Unit test |
+| # | Bug (before the fix) | Found by | Unit test (now asserts the fix) |
 |---|---|---|---|
-| 1 | **Cancelled order fulfilled at a discount.** Confirm-reject refunds `wallet_ngn`, but `total_ngn` stays as the card remainder. If the customer then pays the Paystack page that was still open, `fulfillOrder` accepts `cancelled` and the order is paid for the remainder only. | TLC P1 (`P1_noother`) | "a cancelled order is fulfilled for the card remainder…" |
-| 2 | **Double refund.** If Paystack init fails while an admin is confirming a reject, `undoWallet` and confirm-reject both refund the wallet part. | TLC P2 (`minus_FixNoUndo`) | "the wallet part is refunded twice…" |
-| 3 | **Refund of money never taken.** The claim on the order and `debit_wallet` are separate statements. A cancel between them refunds the claimed amount. If the debit then fails (the balance was spent elsewhere), the order is reset, and the refund stays. | TLC P2/P3 | "a cancel between the wallet claim and the debit…" |
-| 4 | **Silent overcharge.** An older full-price Paystack page (another tab) can be paid after a later attempt applied the wallet, or two pages can both be paid. Settle returns `ok`/`already` without logging or refunding the extra. | TLC P4 | "paying an older full-price Paystack page…" |
-| 5 | **Honest mismatch.** Tab 2 opens a page for the remainder while tab 1 holds the wallet. Tab 1's Paystack init then fails and undoes the wallet, so tab 2's payment no longer matches `total_ngn` and the order stays pending. | TLC P5 | "an honest customer gets 'amount does not match'…" |
-| 6 | **One use per customer not enforced.** `discount_usages` is written at payment. Two orders placed before either is paid both get the code. | TLC `OneUsePerCustomer` | "one customer gets a 'one use per customer' code twice" |
-| 7 | **`max_uses` not enforced.** It is checked at order creation and counted at payment, so pending orders overshoot it. | TLC `WithinMaxUses` | "a code with max_uses = 1 is used by two customers" |
-| 8 | **Negative discount.** PATCH `/v2/admin/discounts/:id` doesn't validate `value`, and `discount_codes` has no CHECK constraint. A negative value makes the API charge more than the subtotal, while the web clamps the discount at 0 and shows less. The admin form blocks values ≤ 0; the API doesn't. | Lean: `parity` needs `0 ≤ raw`; `parity_fails_for_negative_value` | "PATCH accepts a negative value…" |
+| 1 | **Cancelled order fulfilled at a discount.** Confirm-reject refunded `wallet_ngn`, but `total_ngn` stayed as the card remainder. If the customer then paid the Paystack page that was still open, `fulfillOrder` accepted `cancelled` and the order was paid for the remainder only. | TLC P1 (`P1_noother`) | "a payment for the card remainder after the order was cancelled…" |
+| 2 | **Double refund.** If Paystack init failed while an admin was confirming a reject, `undoWallet` and confirm-reject both refunded the wallet part. | TLC P2 (`minus_FixNoUndo`) | "the wallet part is returned once…" |
+| 3 | **Refund of money never taken.** The claim on the order and `debit_wallet` were separate statements. A cancel between them refunded the claimed amount. If the debit then failed (the balance was spent elsewhere), the order was reset, and the refund stayed. | TLC P2/P3 | "a cancel racing the wallet step…" |
+| 4 | **Silent overcharge.** An older full-price Paystack page (another tab) could be paid after a later attempt applied the wallet, or two pages could both be paid. Settle returned `ok`/`already` without logging the extra. | TLC P4 | "paying an older full-price page…", "a full-price page paid after the wallet covered…" |
+| 5 | **Honest mismatch.** Tab 2 opened a page for the remainder while tab 1 held the wallet. Tab 1's Paystack init then failed and undid the wallet, so tab 2's payment no longer matched `total_ngn` and the order stayed pending. | TLC P5 | "a concurrent attempt whose Paystack init fails…" |
+| 6 | **One use per customer not enforced.** `discount_usages` was written at payment. Two orders placed before either was paid both got the code. | TLC `OneUsePerCustomer` | "an order placed after an abandoned one takes over the use…", "…the second use is logged" |
+| 7 | **`max_uses` not enforced.** It was checked at order creation and counted at payment, so pending orders overshot it. | TLC `WithinMaxUses` | "max_uses counts unpaid orders…", "cancelling an unpaid order frees its use" |
+| 8 | **Negative discount.** PATCH `/v2/admin/discounts/:id` didn't validate `value`, and `discount_codes` had no CHECK constraint. A negative value made the API charge more than the subtotal, while the web clamps the discount at 0 and shows less. The admin form blocks values ≤ 0; the API didn't. | Lean: `parity` needs `0 ≤ raw`; `parity_fails_for_negative_value` | "PATCH … is refused" (six cases) |
 
 **Proved in Lean** (no `sorry`):
 
@@ -54,41 +56,59 @@ Each property is checked only when no request is mid-flight and every captured p
 - Buying more never lowers the volume-tier percent.
 - A volume discount (≤ 90%) never exceeds its line.
 
-## Proposed fixes, as modelled
+## The fixes
 
-None of these is applied to the code. Each one is a `Fix*` constant in `Checkout.tla`:
+Each `Fix*` constant in `Checkout.tla` is one of these changes. The `All_fixed*` configs check the code as it is now; the `P*_current` configs check the code before the fix.
 
-| Constant | Change |
+| Constant | Implemented as |
 |---|---|
-| `FixAtomic` | Apply the wallet in one RPC: lock the wallet and order rows, debit, and set `wallet_ngn` / `total_ngn` together. |
-| `FixNoUndo` | When Paystack init fails, leave the wallet part on the order. The retry path already charges only the remainder, and cancelling returns the wallet part. |
-| `FixCancel` | The cancelling UPDATE also sets `wallet_ngn = 0, total_ngn = total_ngn + wallet_ngn` and returns the old `wallet_ngn`; that returned value is what gets refunded. |
-| `FixSettle` | The amount check is part of `fulfillOrder`'s conditional UPDATE (`... AND total_ngn <= paid`), not a comparison with an earlier read. |
-| `FixDup` | A capture that pays more than `total_ngn` at that moment, or that lands on an already-paid order, is logged for refund. |
+| `FixAtomic` | `apply_order_wallet` RPC: locks the order and the wallet, debits, and sets `wallet_ngn` / `total_ngn` in one transaction. With Paystack off, it only applies a wallet that covers the whole order. |
+| `FixNoUndo` | `/v2/pay/init` no longer hands the wallet part back when Paystack can't be started. A retry charges only the remainder, and cancelling returns it. |
+| `FixCancel` | `cancel_rejected_order` RPC: cancels, sets `wallet_ngn = 0` and `total_ngn = total_ngn + wallet_ngn`, refunds the amount it took off, and releases the promo reservation. |
+| `FixSettle` | `fulfillOrder`'s claim includes `total_ngn <= paid` (`opts.maxTotalNGN`), and records the paying reference (`opts.paystackRef`). |
+| `FixDup` | `settlePaystackPayment` logs `payment_overpaid` (paid more than `total_ngn` at the claim) and `payment_duplicate` (the order was already paid by another reference or the wallet). The webhook and `/v2/pay/verify` settling the same reference is not a duplicate. |
 
-**Results with the fixes:**
+**Checkout results:**
 
 - With all five on, P1–P5 hold:
   - 2 attempts and 3 admin actions: 26k states.
   - Wallet ≥ price: 57k states.
   - 3 attempts and 4 admin actions: 2.4M states.
 - Turning off any single fix breaks a property again (the `minus_*` configs).
-- `FixCancel` alone is not enough. TLC showed that settle's earlier read still lets the remainder through, which is why `FixSettle` exists.
 
-**Discount usage fix (`FixReserve`):**
+**Promo codes** (`DiscountUsage.tla` with `FixReserve`):
 
-- Placing an order reserves the use, together with `times_used + held < max_uses`, in one statement.
-- Cancelling releases the reservation.
-- With `FixReserve` on, both discount properties hold.
-- Trade-off: an abandoned pending order holds its use until it's cancelled.
+- `reserve_discount_use` runs when an order is placed, and again at `/v2/pay/init`. A customer's newer unpaid order takes over the use held by their older one, so an abandoned checkout doesn't lock them out. `max_uses` counts uses held by unpaid orders.
+- `record_discount_use` counts the use at payment.
+- A payment that can't be refused is logged instead:
+  - `discount_reused`: two Paystack pages were open at once and both were paid.
+  - `discount_over_limit`: the order had no reservation, for example one placed before migration 24.
 
-**Negative discount fix:**
+**Promo-code results** (max_uses 1 and 2, 4 orders, 2 customers):
 
-- Validate `value > 0` on PATCH, and `≤ 100` for percentage codes.
-- Add `CHECK (value > 0)` on `discount_codes`.
+- These all hold:
+  - One use per customer and `max_uses`, counting everything except logged payments.
+  - `NoWrongRefusal`: a customer is refused only when their use was spent or others fill `max_uses`.
+  - `times_used` stays accurate.
+- `D_reach_logged` shows the logged path is reachable, so those properties aren't vacuous.
+
+**Discount values:**
+
+- POST and PATCH on `/v2/admin/discounts` check:
+  - value > 0
+  - percentage ≤ 100
+  - non-negative minimum and cap
+  - whole `max_uses`
+- Migration 24 adds matching CHECKs.
+
+**Migration testing:**
+
+- The SQL was run forward, back and forward on PGlite with a stub schema.
+- 33 scenario checks passed: wallet apply, cancel, reserve, record, and the constraints.
+- `test/fakeDb.ts` implements the same four functions for the unit tests.
 
 ## Limits
 
 - **Bounded checks.** TLC checks small instances: one order, 2–3 attempts, a few admin actions, and amounts of 10 and 4 (or 12). The Lean proofs cover all integers but abstract away the 2-decimal rounding and the fx rate.
-- **Hand-written models.** The models were written by hand from the code, so a drift between model and code is possible. The unit tests are what tie each finding back to the real handlers.
+- **Hand-written models.** The models were written by hand from the code, so a drift between model and code is possible. The unit tests tie each finding to the real handlers, but they run against `test/fakeDb.ts`, whose RPCs re-implement the SQL in TypeScript. The SQL itself was only checked separately, on PGlite.
 - **Not modelled:** wallet top-ups (`settle_wallet_topup` locks and is idempotent), partner payouts, and referral rewards (both unique-keyed in SQL). I read them and found nothing in the same class.

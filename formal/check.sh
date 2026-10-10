@@ -24,17 +24,18 @@ tlc() { # spec cfg expect(ok|violated)
   printf '%-11s %-30s %s\n' "$mark" "$2" "$got"
 }
 
-echo "Checkout.tla, code as it is (each should be violated)"
+echo "Checkout.tla, the code before migration 24 (each should be violated)"
 for c in P1_current P1_noother P2_current P3_current P4_current P5_current; do tlc Checkout $c violated; done
-echo "Checkout.tla, with all proposed fixes (should hold)"
+echo "Checkout.tla, with the fixes as implemented (should hold)"
 for c in All_fixed All_fixed_W12 All_fixed_big; do tlc Checkout $c ok; done
 echo "Checkout.tla, all fixes but one (each should be violated)"
 for c in minus_FixAtomic minus_FixNoUndo minus_FixCancel minus_FixDup minus_FixSettle; do tlc Checkout $c violated; done
 echo "DiscountUsage.tla"
 tlc DiscountUsage D_OneUsePerCustomer_current violated
 tlc DiscountUsage D_WithinMaxUses_current violated
-tlc DiscountUsage D_OneUsePerCustomer_fixed ok
-tlc DiscountUsage D_WithinMaxUses_fixed ok
+tlc DiscountUsage D_fixed_max1 ok
+tlc DiscountUsage D_fixed_max2 ok
+tlc DiscountUsage D_reach_logged violated   # the logged path is reachable
 
 echo "Lean"
 if "$LEAN" lean/Discount.lean; then echo "pass        Discount.lean"; else echo "UNEXPECTED  Discount.lean"; fail=1; fi

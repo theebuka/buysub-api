@@ -46,30 +46,95 @@ export class FakeDb {
 
   from(table: string) { return new Query(this, table); }
 
+  walletMove(fn: string, args: any): { data: any; error: any } {
+    const w = this.row('wallets', args.p_wallet_id);
+    if (!w) return { data: null, error: { message: 'Wallet not found' } };
+    const amt = Number(args.p_amount);
+    if (fn === 'debit_wallet' && Number(w.balance_ngn) < amt) {
+      return { data: null, error: { message: `Insufficient wallet balance. Available: ${w.balance_ngn}, Requested: ${amt}` } };
+    }
+    w.balance_ngn = Number(w.balance_ngn) + (fn === 'credit_wallet' ? amt : -amt);
+    this.t('wallet_transactions').push({
+      id: this.nextId('wallet_transactions'), wallet_id: w.id, type: fn === 'credit_wallet' ? 'credit' : 'debit',
+      amount_ngn: amt, source: args.p_source ?? 'order_payment', reference: args.p_reference, balance_after: w.balance_ngn,
+    });
+    return { data: w.balance_ngn, error: null };
+  }
+
   async rpc(fn: string, args: any = {}): Promise<{ data: any; error: any }> {
     await this.hooks.rpc?.(fn, args);
     switch (fn) {
       case 'generate_order_ref':
         return { data: `BS-${1000 + ++this.seq}`, error: null };
       case 'credit_wallet':
-      case 'debit_wallet': {
-        const w = this.row('wallets', args.p_wallet_id);
-        if (!w) return { data: null, error: { message: 'Wallet not found' } };
-        const amt = Number(args.p_amount);
-        if (fn === 'debit_wallet' && Number(w.balance_ngn) < amt) {
-          return { data: null, error: { message: `Insufficient wallet balance. Available: ${w.balance_ngn}, Requested: ${amt}` } };
-        }
-        w.balance_ngn = Number(w.balance_ngn) + (fn === 'credit_wallet' ? amt : -amt);
-        this.t('wallet_transactions').push({
-          id: this.nextId('wallet_transactions'), wallet_id: w.id, type: fn === 'credit_wallet' ? 'credit' : 'debit',
-          amount_ngn: amt, source: args.p_source ?? 'order_payment', reference: args.p_reference, balance_after: w.balance_ngn,
-        });
-        return { data: w.balance_ngn, error: null };
-      }
+      case 'debit_wallet':
+        return this.walletMove(fn, args);
       case 'increment_discount_usage': {
         const d = this.row('discount_codes', args.p_discount_id);
         if (d) d.times_used = Number(d.times_used || 0) + 1;
         return { data: null, error: null };
+      }
+      // Migration 24. These mirror supabase-migrations/24_order_money_atomic.sql
+      // statement for statement; each runs as one step here, as the SQL runs
+      // under row locks in one transaction.
+      case 'apply_order_wallet': {
+        const o = this.row('orders', args.p_order_id);
+        if (!o) return { data: { result: 'missing' }, error: null };
+        if (o.status !== 'pending') return { data: { result: 'not_pending' }, error: null };
+        if (Number(o.wallet_ngn || 0) > 0) return { data: { result: 'already', amount: o.wallet_ngn, total_ngn: o.total_ngn }, error: null };
+        const w = this.row('wallets', args.p_wallet_id);
+        if (!w || w.is_active === false || Number(w.balance_ngn) <= 0 || Number(o.total_ngn) <= 0) return { data: { result: 'empty' }, error: null };
+        if (!this.t('customers').some(c => c.id === o.customer_id && c.user_id === w.user_id)) return { data: { result: 'not_owner' }, error: null };
+        if (args.p_require_full && Number(w.balance_ngn) < Number(o.total_ngn)) return { data: { result: 'insufficient' }, error: null };
+        const amount = Math.min(Number(w.balance_ngn), Number(o.total_ngn));
+        const debit = await this.walletMove('debit_wallet', { p_wallet_id: w.id, p_amount: amount, p_reference: o.order_ref });
+        if (debit.error) return debit;
+        Object.assign(o, { wallet_ngn: amount, total_ngn: Number(o.total_ngn) - amount });
+        return { data: { result: 'ok', amount, total_ngn: o.total_ngn }, error: null };
+      }
+      case 'cancel_rejected_order': {
+        const o = this.row('orders', args.p_order_id);
+        if (!o) return { data: { result: 'missing' }, error: null };
+        if (o.status !== 'rejected_pending') return { data: { result: 'changed' }, error: null };
+        const held = Number(o.wallet_ngn || 0);
+        Object.assign(o, { status: 'cancelled', notes: args.p_notes, wallet_ngn: 0, total_ngn: Number(o.total_ngn) + held });
+        this.tables.discount_usages = this.t('discount_usages').filter(u => u.order_id !== o.id);
+        if (held > 0) {
+          const c = this.t('customers').find(c => c.id === o.customer_id);
+          const w = this.t('wallets').find(w => c && w.user_id === c.user_id);
+          if (!w) return { data: null, error: { message: `cancel_rejected_order: no wallet for ${o.order_ref}` } };
+          await this.walletMove('credit_wallet', { p_wallet_id: w.id, p_amount: held, p_reference: `${o.order_ref} cancelled`, p_source: 'refund' });
+        }
+        return { data: { result: 'ok', refunded: held }, error: null };
+      }
+      case 'reserve_discount_use':
+      case 'record_discount_use': {
+        const d = this.row('discount_codes', args.p_discount_id);
+        if (!d) return { data: 'missing', error: null };
+        const record = fn === 'record_discount_use';
+        const status = (id: string) => this.row('orders', id)?.status ?? null;
+        const held = () => this.t('discount_usages').filter(u => u.discount_id === d.id && status(u.order_id) !== 'paid').length;
+        if (args.p_customer_id) {
+          const u = this.t('discount_usages').find(u => u.discount_id === d.id && u.customer_id === args.p_customer_id);
+          if (u) {
+            if (u.order_id !== args.p_order_id) {
+              const s = status(u.order_id);
+              if (s === null || s === 'paid') return { data: record ? 'duplicate' : 'used', error: null };
+              u.order_id = args.p_order_id;
+            }
+            if (!record) return { data: 'ok', error: null };
+            d.times_used = Number(d.times_used || 0) + 1;
+            return { data: 'counted', error: null };
+          }
+        }
+        const full = d.max_uses != null && Number(d.times_used || 0) + held() >= Number(d.max_uses);
+        if (!record && full) return { data: 'exhausted', error: null };
+        if (args.p_customer_id) {
+          this.t('discount_usages').push({ id: this.nextId('discount_usages'), discount_id: d.id, order_id: args.p_order_id, customer_id: args.p_customer_id });
+        }
+        if (!record) return { data: 'ok', error: null };
+        d.times_used = Number(d.times_used || 0) + 1;
+        return { data: full ? 'over_limit' : 'counted', error: null };
       }
       default:
         return { data: null, error: null };

@@ -755,6 +755,7 @@ type PreparedOrder = {
   /** The volume-tier part of discountNGN (migration 19). */
   volumeNGN: number;
   discountCode: string | null;
+  discountId: string | null;
   affiliateId: string | null;
   referralCode: string | null;
   /** A customer's refer-and-earn code was used (features/referrals.ts). */
@@ -825,6 +826,7 @@ async function prepareOrder(
   // ── Discount (server-side, authoritative) ──
   let discountNGN = 0;
   let discountCode: string | null = null;
+  let discountId: string | null = null;
   const requestedCode = String(body.discount_code || '').trim().toUpperCase();
   if (requestedCode) {
     const { data: disc } = await db.from('discount_codes')
@@ -837,21 +839,27 @@ async function prepareOrder(
     if (!result.valid) return fail(`Promo code ${requestedCode}: ${result.error} Remove it and try again.`);
 
     // One use per customer (discount_usages is unique on discount_id + customer_id).
+    // A row held by one of their unpaid orders is a reservation this order
+    // takes over (reserve_discount_use, migration 24); only a paid one counts.
     const { data: existingCustomer } = await db.from('customers')
       .select('id')
       .ilike('email', escapeLike(email))
       .limit(1);
     if (existingCustomer?.length) {
       const { data: used } = await db.from('discount_usages')
-        .select('id')
+        .select('order_id, orders(status)')
         .eq('discount_id', disc.id)
         .eq('customer_id', existingCustomer[0].id)
         .limit(1);
-      if (used?.length) return fail(`You've already used promo code ${requestedCode}. Remove it and try again.`);
+      const holder: any = used?.[0];
+      if (holder && (holder.orders?.status ?? 'paid') === 'paid') {
+        return fail(`You've already used promo code ${requestedCode}. Remove it and try again.`);
+      }
     }
 
     discountNGN = result.discount_ngn;
     discountCode = disc.code;
+    discountId = disc.id;
   }
 
   // ── Affiliate (codes are stored upper-case) ──
@@ -884,16 +892,29 @@ async function prepareOrder(
     order: {
       email, items, subtotalNGN,
       discountNGN: Math.min(subtotalNGN, Math.round((volumeNGN + discountNGN) * 100) / 100),
-      volumeNGN, discountCode, affiliateId, referralCode, referrerUserId, currency,
+      volumeNGN, discountCode, discountId, affiliateId, referralCode, referrerUserId, currency,
       fxRate: currency === 'NGN' ? 1 : fxRate,
     },
   };
 }
 
+/** reserve_discount_use (migration 24). Returns the reason it can't be used, or null. */
+async function reserveDiscount(
+  db: SupabaseClient, discountId: string, customerId: string | null, orderId: string, code: string,
+): Promise<string | null> {
+  const { data, error } = await db.rpc('reserve_discount_use', {
+    p_discount_id: discountId, p_customer_id: customerId, p_order_id: orderId,
+  });
+  if (error) return `Could not apply promo code ${code}. Try again.`;
+  if (data === 'used') return `You've already used promo code ${code}. Remove it and try again.`;
+  if (data === 'exhausted') return `Promo code ${code} has reached its usage limit. Remove it and try again.`;
+  return null; // 'ok', or 'missing' (the code was deleted; the order keeps its price)
+}
+
 async function insertOrderWithItems(
   db: SupabaseClient, prepared: PreparedOrder, body: CreateOrderRequest,
   status: 'pending' | 'pending_manual', paymentMethod: 'paystack' | 'whatsapp',
-): Promise<{ order: any; orderRef: string; totalNGN: number } | { error: string }> {
+): Promise<{ order: any; orderRef: string; totalNGN: number } | { error: string; status?: number }> {
   const totalNGN = Math.max(0, prepared.subtotalNGN - prepared.discountNGN);
 
   const customerId = await findOrCreateCustomer(db, {
@@ -966,6 +987,18 @@ async function insertOrderWithItems(
     return { error: 'Failed to save order items: ' + iErr.message };
   }
 
+  // Hold the promo code for this order: one use per customer, and max_uses
+  // counting unpaid orders too. Checking at creation and counting at payment
+  // let two unpaid orders both get it (formal/tla/DiscountUsage.tla).
+  if (prepared.discountId) {
+    const held = await reserveDiscount(db, prepared.discountId, customerId, order.id, prepared.discountCode!);
+    if (held) {
+      await db.from('order_items').delete().eq('order_id', order.id);
+      await db.from('orders').delete().eq('id', order.id);
+      return { error: held, status: 409 };
+    }
+  }
+
   await logEvent(db, 'order', order.id, 'created', null, {
     order_ref: orderRef,
     payment_method: paymentMethod,
@@ -994,7 +1027,7 @@ async function handleCreateOrder(
     if (!prepared.ok) return prepared.response;
 
     const created = await insertOrderWithItems(db, prepared.order, body, 'pending', 'paystack');
-    if ('error' in created) return err(created.error, 500, request, env);
+    if ('error' in created) return err(created.error, created.status ?? 500, request, env);
 
     return ok({
       order_id: created.order.id,
@@ -1026,7 +1059,7 @@ async function handleWhatsAppOrder(
     if (!prepared.ok) return prepared.response;
 
     const created = await insertOrderWithItems(db, prepared.order, body, 'pending_manual', 'whatsapp');
-    if ('error' in created) return err(created.error, 500, request, env);
+    if ('error' in created) return err(created.error, created.status ?? 500, request, env);
 
     const { orderRef, totalNGN } = created;
     const { items, subtotalNGN: serverSubtotal, discountNGN, discountCode, currency, fxRate } = prepared.order;
@@ -1095,13 +1128,15 @@ async function handleWhatsAppOrder(
 // Turn a successful Paystack transaction into a paid order. Shared by the
 // webhook, /v2/pay/verify and /v2/pay/init (an earlier attempt already paid).
 // 'mismatch' means Paystack took less than the order total, or another currency.
+// 'duplicate' means the order was already paid some other way (another
+// Paystack page, the wallet); it's logged as payment_duplicate for a refund.
 async function settlePaystackPayment(
   db: SupabaseClient, order: any, tx: any, env: Env,
-): Promise<'ok' | 'already' | 'ignored' | 'mismatch'> {
+): Promise<'ok' | 'already' | 'duplicate' | 'ignored' | 'mismatch'> {
   if (tx?.status !== 'success') return 'ignored';
 
-  const expectedKobo = Math.round(Number(order.total_ngn) * 100);
-  if (tx.currency !== 'NGN' || Number(tx.amount) < expectedKobo) {
+  const paidKobo = Number(tx.amount);
+  const mismatch = async (expectedKobo: number) => {
     await logEvent(db, 'order', order.id, 'payment_amount_mismatch', null, {
       order_ref: order.order_ref,
       reference: tx.reference,
@@ -1109,16 +1144,44 @@ async function settlePaystackPayment(
       paid_kobo: tx.amount,
       currency: tx.currency,
     });
-    return 'mismatch';
-  }
+    return 'mismatch' as const;
+  };
+  const expectedKobo = Math.round(Number(order.total_ngn) * 100);
+  if (tx.currency !== 'NGN' || paidKobo < expectedKobo) return mismatch(expectedKobo);
 
-  // The order may have been re-initialised since this attempt; record which reference paid.
-  if (order.paystack_ref !== tx.reference) {
-    await db.from('orders').update({ paystack_ref: tx.reference }).eq('id', order.id);
-  }
+  // total_ngn can change after the read above (a cancel puts the wallet part
+  // back), so the claim checks the amount again in the same UPDATE. It also
+  // records which reference paid.
+  const transitioned = await fulfillOrder(db, order.id, 'paystack', env, undefined, {
+    paystackRef: tx.reference,
+    maxTotalNGN: paidKobo / 100,
+  });
+  const { data: now } = await db.from('orders')
+    .select('status, total_ngn, paystack_ref, payment_method')
+    .eq('id', order.id).maybeSingle();
+  const totalKobo = Math.round(Number(now?.total_ngn ?? order.total_ngn) * 100);
 
-  const transitioned = await fulfillOrder(db, order.id, 'paystack', env);
-  return transitioned ? 'ok' : 'already';
+  if (transitioned) {
+    // Paid more than was owed: a full-price page from before the wallet was applied.
+    if (paidKobo > totalKobo) {
+      await logEvent(db, 'order', order.id, 'payment_overpaid', null, {
+        order_ref: order.order_ref, reference: tx.reference,
+        paid_kobo: paidKobo, expected_kobo: totalKobo, excess_kobo: paidKobo - totalKobo,
+      });
+    }
+    return 'ok';
+  }
+  if (now?.status === 'paid') {
+    // The webhook and /v2/pay/verify both settle the same transaction.
+    if (now.payment_method === 'paystack' && now.paystack_ref === tx.reference) return 'already';
+    await logEvent(db, 'order', order.id, 'payment_duplicate', null, {
+      order_ref: order.order_ref, reference: tx.reference, paid_kobo: paidKobo,
+      paid_by: now.payment_method, paid_reference: now.paystack_ref,
+    });
+    return 'duplicate';
+  }
+  if (now && paidKobo < totalKobo) return mismatch(totalKobo);
+  return 'already';
 }
 
 async function findOrderForTx(db: SupabaseClient, tx: any): Promise<any | null> {
@@ -1130,23 +1193,6 @@ async function findOrderForTx(db: SupabaseClient, tx: any): Promise<any | null> 
   if (!orderId) return null;
   const { data: byId } = await db.from('orders').select('*').eq('id', orderId).maybeSingle();
   return byId ?? null;
-}
-
-
-async function refundWalletForOrder(db: SupabaseClient, order: any, amount: number, reason: string): Promise<void> {
-  if (!(amount > 0) || !order.customer_id) return;
-  const { data: customer } = await db.from('customers').select('user_id').eq('id', order.customer_id).maybeSingle();
-  if (!customer?.user_id) return;
-  const { data: wallet } = await db.from('wallets').select('id').eq('user_id', customer.user_id).maybeSingle();
-  if (!wallet) return;
-  const { error } = await db.rpc('credit_wallet', {
-    p_wallet_id: wallet.id,
-    p_amount: amount,
-    p_reference: `${order.order_ref} ${reason}`,
-    p_source: 'refund',
-  });
-  if (error) console.error('Wallet refund failed:', order.order_ref, error.message);
-  else await logEvent(db, 'order', order.id, 'wallet_refunded', null, { amount_ngn: amount, reason });
 }
 
 
@@ -1184,18 +1230,29 @@ async function handlePaystackInit(
     const prior = await paystackVerifyTx(order.paystack_ref, env);
     if (prior?.status === 'success') {
       const settled = await settlePaystackPayment(db, order, prior, env);
-      if (settled === 'ok' || settled === 'already') {
+      if (settled === 'ok' || settled === 'already' || settled === 'duplicate') {
         return ok({ already_paid: true, order_ref: order.order_ref }, request, env);
       }
     }
   }
 
-  const originalTotal = Number(order.total_ngn);
-  let amountToCharge = originalTotal;
-  let walletDeducted = 0;
+  // Promo code: hold this customer's use for this order before any money
+  // moves. If another order of theirs was paid with it, stop here.
+  if (order.discount_code) {
+    const { data: disc } = await db.from('discount_codes')
+      .select('id').eq('code', order.discount_code).maybeSingle();
+    if (disc) {
+      const held = await reserveDiscount(db, disc.id, order.customer_id ?? null, order.id, order.discount_code);
+      if (held) return err(`${held.replace(' Remove it and try again.', '')} Place a new order without it.`, 409, request, env);
+    }
+  }
 
-  // ── Wallet deduction (explicit opt-in, at most once per order) ──
-  if (body.use_wallet && order.customer_id && !(Number(order.wallet_ngn) > 0)) {
+  let amountToCharge = Number(order.total_ngn);
+  // A retry of an order whose wallet part is already applied: total_ngn is the remainder.
+  let walletApplied = Number(order.wallet_ngn) > 0;
+
+  // ── Wallet (explicit opt-in, at most once per order) ──
+  if (body.use_wallet && order.customer_id && !walletApplied) {
     const { data: customer } = await db.from('customers')
       .select('user_id').eq('id', order.customer_id).single();
 
@@ -1224,46 +1281,43 @@ async function handlePaystackInit(
     }
 
     const { data: wallet } = await db.from('wallets')
-      .select('*').eq('user_id', customer.user_id).single();
+      .select('id').eq('user_id', customer.user_id).maybeSingle();
 
-    if (wallet && wallet.is_active !== false && Number(wallet.balance_ngn) > 0) {
-      const amount = Math.min(Number(wallet.balance_ngn), amountToCharge);
-
-      // Claim the deduction on the order first, so two concurrent inits can't both debit.
-      const { data: claimed } = await db.from('orders')
-        .update({ wallet_ngn: amount, total_ngn: amountToCharge - amount })
-        .eq('id', order.id)
-        .eq('status', 'pending')
-        .or('wallet_ngn.is.null,wallet_ngn.eq.0')
-        .select('id');
-
-      if (claimed?.length) {
-        const { error: debitErr } = await db.rpc('debit_wallet', {
-          p_wallet_id: wallet.id,
-          p_amount: amount,
-          p_reference: order.order_ref,
-        });
-        if (debitErr) {
-          await db.from('orders').update({ wallet_ngn: 0, total_ngn: originalTotal }).eq('id', order.id);
-          return err('Could not use your wallet balance: ' + debitErr.message, 409, request, env);
-        }
-        walletDeducted = amount;
-        amountToCharge -= amount;
+    if (wallet) {
+      // One RPC locks the order and the wallet, debits, and sets wallet_ngn and
+      // total_ngn together (migration 24). Claiming and debiting in separate
+      // calls let a cancel in between refund money never taken
+      // (formal/tla/Checkout.tla). With Paystack off it only applies a wallet
+      // that covers the whole order.
+      const { data: applied, error: applyErr } = await db.rpc('apply_order_wallet', {
+        p_order_id: order.id, p_wallet_id: wallet.id, p_require_full: !paystackOn,
+      });
+      if (applyErr) return err('Could not use your wallet balance: ' + applyErr.message, 409, request, env);
+      const r: any = applied || {};
+      if (r.result === 'ok' || r.result === 'already') {
+        walletApplied = true;
+        amountToCharge = Number(r.total_ngn);
+      } else if (r.result === 'not_pending') {
+        return err('Order not found or already processed', 404, request, env);
+      } else if (r.result === 'insufficient') {
+        return err('Card and bank payments are paused right now, and your wallet doesn’t cover this order.', 503, request, env);
       }
     }
   }
 
   // Checkout showed the shopper a total with the wallet taken off. If none of
-  // it could be taken (empty or disabled wallet, lost claim), stop rather than
-  // charge them the full amount on Paystack. A retry of an order whose wallet
-  // part is already taken passes: its total_ngn is already the remainder.
-  if (body.use_wallet && walletDeducted === 0 && !(Number(order.wallet_ngn) > 0)) {
+  // it could be applied (empty or frozen wallet), stop rather than charge them
+  // the full amount on Paystack.
+  if (body.use_wallet && !walletApplied) {
     return err('Your wallet balance couldn’t be applied to this order, so nothing was charged. Refresh and try again.', 409, request, env);
   }
 
   // If fully paid by wallet
   if (amountToCharge <= 0) {
-    await fulfillOrder(db, order.id, 'wallet', env, ['pending']);
+    const paid = await fulfillOrder(db, order.id, 'wallet', env, ['pending']);
+    if (!paid) {
+      return err('This order changed while you were paying. Your wallet amount is held on it; refresh to see where it stands.', 409, request, env);
+    }
     await clearCartForPaidOrder(db, order);
     return ok({
       fully_paid_by_wallet: true,
@@ -1271,16 +1325,14 @@ async function handlePaystackInit(
     }, request, env);
   }
 
-  // Undo the wallet part of this attempt if Paystack can't be started.
-  const undoWallet = async () => {
-    if (walletDeducted <= 0) return;
-    await refundWalletForOrder(db, order, walletDeducted, 'paystack init failed');
-    await db.from('orders').update({ wallet_ngn: 0, total_ngn: originalTotal }).eq('id', order.id);
-  };
+  // The wallet part is not handed back if Paystack can't be started: a retry
+  // charges only the remainder, and cancelling the order returns it. Handing
+  // it back here raced the admin's cancel (two refunds) and any other open
+  // Paystack page for the remainder (a payment that no longer matched).
+  const keptNote = walletApplied ? ' The wallet amount already applied stays on this order.' : '';
 
   if (!paystackOn) {
-    await undoWallet();
-    return err('Card and bank payments are paused right now, and your wallet doesn’t cover this order.', 503, request, env);
+    return err('Card and bank payments are paused right now.' + keptNote, 503, request, env);
   }
 
   // ── Init Paystack transaction ──
@@ -1313,17 +1365,16 @@ async function handlePaystackInit(
     });
     paystackData = await paystackRes.json();
   } catch (e: any) {
-    await undoWallet();
-    return err('Payment initialization failed: ' + (e?.message || 'network error'), 502, request, env);
+    return err('Payment initialization failed: ' + (e?.message || 'network error') + '.' + keptNote, 502, request, env);
   }
 
   if (!paystackData?.status) {
-    await undoWallet();
-    return err('Payment initialization failed: ' + (paystackData?.message || 'Unknown error'), 500, request, env);
+    return err('Payment initialization failed: ' + (paystackData?.message || 'Unknown error') + '.' + keptNote, 500, request, env);
   }
 
-  // Save paystack ref on order
-  await db.from('orders').update({ paystack_ref: paystackRef }).eq('id', order.id);
+  // Save paystack ref on order. Only while it's unpaid: once paid, paystack_ref
+  // is the reference that paid it, which settle uses to spot a second payment.
+  await db.from('orders').update({ paystack_ref: paystackRef }).eq('id', order.id).eq('status', 'pending');
 
   return ok({
     authorization_url: paystackData.data.authorization_url,
@@ -1755,16 +1806,21 @@ async function fulfillOrder(
   paymentMethod: string | null, // null: keep the order's current payment_method
   env: Env,
   allowedFrom: string[] = ['pending', 'pending_manual', 'rejected_pending', 'cancelled', 'failed'],
+  // paystackRef: the reference that paid. maxTotalNGN: only claim if total_ngn
+  // is at most this (what Paystack collected), checked in the same UPDATE.
+  opts: { paystackRef?: string; maxTotalNGN?: number } = {},
 ): Promise<boolean> {
   // 1. Claim the transition to paid
-  const { data: claimed, error: claimErr } = await db.from('orders').update({
+  let claim = db.from('orders').update({
     status: 'paid',
     ...(paymentMethod ? { payment_method: paymentMethod } : {}),
+    ...(opts.paystackRef ? { paystack_ref: opts.paystackRef } : {}),
     paid_at: new Date().toISOString(),
   })
     .eq('id', orderId)
-    .in('status', allowedFrom)
-    .select('id');
+    .in('status', allowedFrom);
+  if (opts.maxTotalNGN !== undefined) claim = claim.lte('total_ngn', opts.maxTotalNGN);
+  const { data: claimed, error: claimErr } = await claim.select('id');
 
   if (claimErr) throw new Error(`Could not mark order ${orderId} paid: ${claimErr.message}`);
   if (!claimed?.length) return false; // already paid, or not in a payable state
@@ -1782,22 +1838,22 @@ async function fulfillOrder(
   // Subscription end dates, for renewal reminders (features/renewals.ts).
   await setOrderExpiry(db, order);
 
-  // 3. Discount usage. discount_usages is unique on (discount_id, customer_id);
-  //    only count the use when that row is new.
+  // 3. Discount usage (record_discount_use, migration 24): takes over the
+  //    customer's reservation and counts the use. A payment can't be refused
+  //    at this point, so a second use or one past max_uses is logged instead.
   if (order.discount_code) {
     const { data: disc } = await db.from('discount_codes')
       .select('id').eq('code', order.discount_code).maybeSingle();
     if (disc) {
-      let firstUse = true;
-      if (order.customer_id) {
-        const { error: usageErr } = await db.from('discount_usages').insert({
-          discount_id: disc.id,
-          order_id: order.id,
-          customer_id: order.customer_id,
+      const { data: use, error: useErr } = await db.rpc('record_discount_use', {
+        p_discount_id: disc.id, p_customer_id: order.customer_id ?? null, p_order_id: order.id,
+      });
+      if (useErr) console.error('record_discount_use failed:', order.order_ref, useErr.message);
+      else if (use === 'duplicate' || use === 'over_limit') {
+        await logEvent(db, 'order', order.id, use === 'duplicate' ? 'discount_reused' : 'discount_over_limit', null, {
+          order_ref: order.order_ref, discount_code: order.discount_code,
         });
-        if (usageErr) firstUse = false;
       }
-      if (firstUse) await db.rpc('increment_discount_usage', { p_discount_id: disc.id });
     }
   }
 
@@ -2454,24 +2510,26 @@ async function handleAdminRejectOrder(
     reason ? [notes, `Rejection reason: ${reason}`].filter(Boolean).join('\n') : notes;
 
   if (confirmReject && order.status === 'rejected_pending') {
-    // Final rejection — move to cancelled
-    const { data: moved } = await db.from('orders').update({
-      status: 'cancelled',
-      notes: withReason(order.notes),
-      updated_at: new Date().toISOString(),
-    }).eq('id', order.id).eq('status', 'rejected_pending').select('id');
-    if (!moved?.length) return err('Order changed while rejecting — reload and try again', 409, request, env);
-
-    // Give back any wallet balance this order had already taken.
-    if (Number(order.wallet_ngn) > 0) {
-      await refundWalletForOrder(db, order, Number(order.wallet_ngn), 'cancelled');
+    // Final rejection: one RPC (migration 24) moves it to cancelled, returns
+    // the wallet part it holds at that moment, puts that amount back into
+    // total_ngn, and releases its promo reservation. Done as separate calls,
+    // a payment for the card remainder still open in another tab paid for the
+    // whole order, and a racing undo refunded the wallet twice.
+    const { data: cancelled, error: cancelErr } = await db.rpc('cancel_rejected_order', {
+      p_order_id: order.id, p_notes: withReason(order.notes), p_actor: auth.userId,
+    });
+    if (cancelErr) return err('Could not cancel the order: ' + cancelErr.message, 500, request, env);
+    if ((cancelled as any)?.result !== 'ok') return err('Order changed while rejecting — reload and try again', 409, request, env);
+    const refunded = Number((cancelled as any).refunded) || 0;
+    if (refunded > 0) {
+      await logEvent(db, 'order', order.id, 'wallet_refunded', auth.userId, { amount_ngn: refunded, reason: 'cancelled' });
     }
 
     await notifyUser(db, await userIdForOrder(db, order), {
       kind: 'order',
       title: `Order ${order.order_ref} was cancelled`,
-      body: Number(order.wallet_ngn) > 0
-        ? `${naira(order.wallet_ngn)} from your wallet has been returned.${reason ? ` Reason: ${reason}` : ''}`
+      body: refunded > 0
+        ? `${naira(refunded)} from your wallet has been returned.${reason ? ` Reason: ${reason}` : ''}`
         : reason ? `Reason: ${reason}` : 'Contact support if you have questions.',
       href: `/account/orders/${encodeURIComponent(order.order_ref)}`,
       dedupe: `order:${order.order_ref}:cancelled`,
@@ -3984,6 +4042,23 @@ async function handleAdminGetDiscounts(
 // ============================================================
 // HANDLER: POST /v2/admin/discounts (Create discount code)
 // ============================================================
+// What the discount engine assumes (formal/lean/Discount.lean): a value of 0
+// or less made the API charge more than the subtotal while checkout showed
+// less. discount_codes has matching CHECKs since migration 24.
+function discountFieldsError(f: Record<string, any>, type: string | undefined): string | null {
+  if (f.type !== undefined && !['percentage', 'fixed'].includes(f.type)) return 'Type must be "percentage" or "fixed"';
+  if (f.value !== undefined) {
+    const v = Number(f.value);
+    if (!Number.isFinite(v) || v <= 0) return 'Value must be a positive number';
+    if (type === 'percentage' && v > 100) return 'A percentage can’t be more than 100';
+  }
+  const given = (k: string) => f[k] !== undefined && f[k] !== null && f[k] !== '';
+  if (given('min_order_ngn') && !(Number(f.min_order_ngn) >= 0)) return 'Minimum order can’t be negative';
+  if (given('max_discount_ngn') && !(Number(f.max_discount_ngn) >= 0)) return 'Cap can’t be negative';
+  if (given('max_uses') && !(Number.isInteger(Number(f.max_uses)) && Number(f.max_uses) >= 0)) return 'Total uses must be a whole number';
+  return null;
+}
+
 async function handleAdminCreateDiscount(
   db: SupabaseClient, request: Request, env: Env
 ): Promise<Response> {
@@ -3996,9 +4071,11 @@ async function handleAdminCreateDiscount(
   if (!body.type || !['percentage', 'fixed'].includes(body.type)) {
     return err('Type must be "percentage" or "fixed"', 400, request, env);
   }
-  if (body.value === undefined || body.value === null || Number(body.value) <= 0) {
+  if (body.value === undefined || body.value === null) {
     return err('Value must be a positive number', 400, request, env);
   }
+  const invalid = discountFieldsError(body, body.type);
+  if (invalid) return err(invalid, 400, request, env);
 
   // Check code uniqueness
   const { data: existing } = await db
@@ -4095,6 +4172,18 @@ async function handleAdminUpdateDiscount(
   if (Object.keys(updates).length === 0) {
     return err('No valid fields to update', 400, request, env);
   }
+
+  // A percentage cap depends on the type, which may not be in this update.
+  let currentType: string | undefined = updates.type;
+  let currentValue: any = updates.value;
+  if (updates.value === undefined || updates.type === undefined) {
+    const { data: cur } = await db.from('discount_codes').select('type, value').eq('id', discountId).maybeSingle();
+    if (!cur) return err('Discount not found', 404, request, env);
+    currentType ??= cur.type;
+    currentValue ??= cur.value;
+  }
+  const invalid = discountFieldsError({ ...updates, value: currentValue }, currentType);
+  if (invalid) return err(invalid, 400, request, env);
 
   const { data, error: dbErr } = await db
     .from('discount_codes')
