@@ -1,0 +1,3 @@
+tla/out_*
+tla/*_TTrace_*
+tla/states/

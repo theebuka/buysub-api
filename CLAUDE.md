@@ -11,10 +11,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 npx wrangler dev        # local dev on http://localhost:8787 (npm run dev)
 npx wrangler deploy     # deploy to Cloudflare (npm run deploy)
-npx tsc --noEmit        # type check — the only verification step in this repo
+npx tsc --noEmit        # type check
+npm test                # vitest: test/*.bugs.test.ts, the Worker against an in-memory Supabase
+./formal/check.sh       # TLC models + Lean proofs of the money paths (see formal/README.md)
 ```
 
-`npm run build` is a deliberate no-op (Wrangler bundles `src/index.ts` directly). There is no test suite, no linter, and no build artifact. **`npx tsc --noEmit` currently passes clean — keep it that way**, since it's the only automated check.
+`npm run build` is a deliberate no-op (Wrangler bundles `src/index.ts` directly). There is no linter and no build artifact. **`npx tsc --noEmit` currently passes clean — keep it that way.** `test/` reproduces known bugs: each BUG test asserts today's behaviour, so fixing one makes its test fail until it's flipped to the correct expectation.
 
 Secrets are set with `npx wrangler secret put <NAME>`, not in `wrangler.toml`. Non-secret vars (`FRONTEND_URL`, `WHATSAPP_NUMBER`, `ALLOWED_ORIGINS`) live under `[vars]` in `wrangler.toml`; adding a frontend origin means editing that comma-separated `ALLOWED_ORIGINS` string. Required secrets: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `PAYSTACK_SECRET_KEY`, `PAYSTACK_PUBLIC_KEY`, `RESEND_API_KEY`, `WEBHOOK_SECRET`.
 
